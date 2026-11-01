@@ -1,0 +1,15 @@
+{
+  "name": "claude-telegram-bridge",
+  "description": "Telegram bridge for Claude Code: a Telegram topic per session, the owner's words arrive as prompts",
+  "owner": {
+    "name": "kerbyfc",
+    "url": "https://github.com/kerbyfc"
+  },
+  "plugins": [
+    {
+      "name": "telegram-bridge",
+      "source": "./",
+      "description": "Telegram bridge for Claude Code: a Telegram topic per session, the owner's words arrive as prompts"
+    }
+  ]
+}
