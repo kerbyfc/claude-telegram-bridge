@@ -20,6 +20,7 @@ const PATH_TURN_START = '/turn/start'
 const PATH_TURN_END = '/turn/end'
 const PATH_CONTEXT = '/context'
 const PATH_MESSAGE = '/message'
+const PATH_NAME = '/name'
 
 /**
  * Имя бинаря моста в `PATH`. Путь к нему перебивает переменная окружения `DM_TELEGRAM_BRIDGE`;
@@ -53,6 +54,14 @@ let front: string | undefined
 
 /** Владельцу о пропавшем канале уже сказано: второй раз одно и то же не говорится. */
 let spoken = false
+
+/**
+ * Название чата, как его последним назвал клиент, и то, какое из названий уже ушло службе на этом
+ * соединении. Служба держит название у себя: имя темы без аргумента берётся из него, а пока оно
+ * меняется — тема переименовывается.
+ */
+let chat = ''
+let named = ''
 
 /** reason называет причину отказа строкой, годной для журнала службы. */
 const reason = (failure: unknown): string =>
@@ -163,6 +172,7 @@ const notice = ($: EngineInterface, path: string, body: unknown): void => {
 }
 
 /**
+/**
  * context называет службе долю занятого окна контекста. Своего счёта мод не ведёт: число знает
  * клиент, у которого окно и считается, а мод его только проводит. Числа у клиента нет (модели без
  * ответа, окно неизвестно) — извещения нет вовсе: править строку состояния нулём значило бы
@@ -215,6 +225,39 @@ const told = ($: EngineInterface): void => {
   void context($).catch((failure: unknown) => {
     $.ui.log(`процент контекста не назван: ${reason(failure)}`, { to: 'debug' })
   })
+}
+
+/**
+ * speakName называет службе запомненное название чата, если на этом входе оно ещё не названо.
+ * Имя темы без аргумента служба берёт из него, а меняется оно — тема переименовывается.
+ */
+const speakName = ($: EngineInterface): void => {
+  if (front === undefined || chat === '' || chat === named) {
+    return
+  }
+
+  named = chat
+  notice($, PATH_NAME, { name: chat })
+}
+
+/**
+ * name запоминает название чата и называет его службе. Приходит оно не событием модуля, а входом
+ * хука клиента (`session_title`), поэтому мод держит его сам и отдаёт, как только у соединения
+ * есть вход: классический хук приходит раньше `session.start`, а вход поднимается им же.
+ */
+const name = ($: EngineInterface, title: unknown): void => {
+  if (typeof title !== 'string') {
+    return
+  }
+
+  const value = title.trim()
+
+  if (value === '' || value === chat) {
+    return
+  }
+
+  chat = value
+  speakName($)
 }
 
 /**
@@ -307,6 +350,10 @@ const take = async ($: EngineInterface, line: string): Promise<void> => {
   switch (event.event) {
     case 'ready':
       front = event.socket
+      // Название, запомненное до входа, уходит службе сразу: иначе имя темы без аргумента пришлось
+      // бы ждать следующего слова владельца, а его у не у компьютера может не быть вовсе.
+      named = ''
+      speakName($)
       $.ui.log(`соединение со службой открыто: ${event.socket}`, { to: 'debug' })
 
       return
@@ -395,6 +442,21 @@ const attach = ($: EngineInterface, session: string): void => {
 }
 
 export const register: Register = on => {
+  // Название чата клиент называет входом классического хука, а не событием модуля: у
+  // `session.start` его нет. Первое название приходит на старте и возврате сессии, дальше — со
+  // словом владельца, набранным в терминале, и переименование чата видно на следующем.
+  on('classic.SessionStart', ($, event, next) => {
+    name($, event.session_title)
+
+    return next(event)
+  })
+
+  on('classic.UserPromptSubmit', ($, event, next) => {
+    name($, event.session_title)
+
+    return next(event)
+  })
+
   on('session.start', async ($, event, next) => {
     const started = await next(event)
 

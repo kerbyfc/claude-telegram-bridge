@@ -870,3 +870,110 @@ test('реплика подагента в тему не уходит', async ($
 
   expect(paths).toEqual(['http://telegram-bridge/bye'])
 })
+
+/** CHAT — название чата, которое клиент кладёт во вход классического хука. */
+const CHAT = 'Проверка моста'
+
+/**
+ * reporter отвечает за `http.fetch` мода и помнит, что и куда ушло. Извещения уходят без
+ * ожидания, поэтому тест ждёт нужного числа коротких запросов, а не гадает по оборотам очереди.
+ */
+const reporter = (on: On): { sent: called[]; wait: (count: number) => Promise<void> } => {
+  const sent: called[] = []
+  const waiters: Array<{ count: number; resolve: () => void }> = []
+
+  on('http.fetch', (_$, event) => {
+    sent.push({ url: event.url, body: body(event.init) })
+
+    for (const waiter of [...waiters]) {
+      if (sent.length < waiter.count) continue
+
+      waiters.splice(waiters.indexOf(waiter), 1)
+      waiter.resolve()
+    }
+
+    return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+  })
+
+  const wait = async (count: number): Promise<void> => {
+    if (sent.length >= count) return
+
+    await new Promise<void>(resolve => {
+      waiters.push({ count, resolve })
+    })
+  }
+
+  return { sent, wait }
+}
+
+/**
+ * hanging держит подкоманду живой до конца теста: соединение кончается по `bye` мода или по
+ * остановке клиентом, и без этого выдача закрылась бы раньше извещений.
+ */
+const hanging = (on: On): (() => void) => {
+  let halted: (() => void) | undefined
+  const ended = new Promise<void>(resolve => {
+    halted = resolve
+  })
+
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+    await ended
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+
+  return () => halted?.()
+}
+
+test('название чата уходит службе и переименовывает тему', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  on('classic.SessionStart', () => ({}))
+  on('classic.UserPromptSubmit', () => ({}))
+
+  const halt = hanging(on)
+  const said = reporter(on)
+
+  // Классический хук приходит раньше `session.start`: вход поднимается уже после него, и название
+  // уезжает службе, как только вход назван.
+  await $.classic.SessionStart({ session_title: CHAT })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await said.wait(1)
+
+  expect(said.sent[0]).toEqual({ url: 'http://telegram-bridge/name', body: { name: CHAT } })
+
+  // Переименование чата видно на следующем слове владельца, набранном в терминале.
+  await $.classic.UserPromptSubmit({ prompt: 'ещё', session_title: 'Новое имя' })
+  await said.wait(2)
+
+  expect(said.sent[1]).toEqual({ url: 'http://telegram-bridge/name', body: { name: 'Новое имя' } })
+
+  halt()
+})
+
+test('то же название чата второй раз службе не называется', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  on('classic.SessionStart', () => ({}))
+  on('classic.UserPromptSubmit', () => ({}))
+
+  const halt = hanging(on)
+  const said = reporter(on)
+
+  await $.classic.SessionStart({ session_title: CHAT })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await said.wait(1)
+
+  await $.classic.UserPromptSubmit({ prompt: 'ещё', session_title: CHAT })
+
+  expect(said.sent).toEqual([{ url: 'http://telegram-bridge/name', body: { name: CHAT } }])
+
+  halt()
+})

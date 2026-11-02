@@ -27,7 +27,8 @@ to the service for the lifetime of the session, and then:
   kept by the service. Typed in the session's Telegram topic, the service handles these commands
   itself; in the terminal the plugin ships the two commands, which call
   `telegram-bridge away on [topic name] --session <session id>` and
-  `telegram-bridge away off --session <session id>` and show the outcome as a terminal line.
+  `telegram-bridge away off --session <session id>` and show the outcome as a terminal line. Without
+  a name, the topic is called after the chat (see "The topic's name is the chat's name" below).
 - **Agent replies go to the topic.** At the end of each turn step the plugin sends the visible
   answer text, whole, as one message (the service splits long ones at Telegram's limit). Tool
   calls, tool input and thinking never reach the topic. A reply interrupted mid-way (Escape, a
@@ -40,6 +41,14 @@ to the service for the lifetime of the session, and then:
   the turn id, so the topic shows "typing…" while the session works, and the share of the context
   window in use, which the service puts into the topic's pinned line. When the client has no number
   for the context window, nothing is reported.
+- **The topic's name is the chat's name.** Until you name the topic yourself, the topic is called
+  after the chat: the plugin reads the session title the client puts into its classic hook input
+  (`session_title`) and tells it to the service as an ordinary name, on start, on resume and on every
+  prompt typed in the terminal. A chat renamed later renames its topic on the next such hook — there
+  is no title event in the hooks module API, and the plugin does not read the client's transcript.
+  A name you type, `/telegram-bridge:away <name>` or `/away <name>` in the topic, wins over the
+  chat's name and stays until you give another one. A session without a title falls back to the bound
+  topic and `default_topic_name`.
 - **Session end.** On `session.end` (except `/clear`, which keeps the connection) the plugin says
   `bye` to the service. If the connection ends any other way, the terminal shows a
   `мост Telegram: …` notice that there is no channel.
