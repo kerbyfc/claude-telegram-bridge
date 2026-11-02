@@ -1,3 +1,18 @@
 {
+  "description": "The question tool: a question with options reaches the session's Telegram topic instead of opening a dialog in the terminal",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "telegram-bridge hook ask",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  },
   "modules": ["./register.ts"]
 }

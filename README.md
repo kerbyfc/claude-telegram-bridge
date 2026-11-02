@@ -5,9 +5,9 @@ from the computer. Each session gets its own topic in a Telegram forum group: th
 replies go to the topic, and what you write in the topic arrives in the session as a new prompt.
 
 The plugin is only the session-side half. It **does not work on its own**: it talks to a local
-service, `telegram-bridge`, which polls the Telegram Bot API, keeps the topics, sessions and the
-owner's message inbox. That service is **not published in this repository**. Without it the plugin
-loads, finds no channel and says so in the terminal.
+service, [`telegram-bridge`](https://github.com/kerbyfc/telegram-bridge), which polls the Telegram
+Bot API, keeps the topics, sessions and the owner's message inbox, and serves the thin client and the
+session adapters. Without it the plugin loads, finds no channel and says so in the terminal.
 
 ## What the plugin does
 
@@ -23,10 +23,19 @@ to the service for the lifetime of the session, and then:
 - **Commands from the topic run in the session.** A slash command written in the topic (other than
   the ones the service handles itself) is run as if you had typed it in the terminal; the plugin
   waits for the session to be idle instead of holding a turn.
+- **Away mode — `/telegram-bridge:away [topic name]` and `/telegram-bridge:here`.** The mode itself is
+  kept by the service. Typed in the session's Telegram topic, the service handles these commands
+  itself; in the terminal the plugin ships the two commands, which call
+  `telegram-bridge away on [topic name] --session <session id>` and
+  `telegram-bridge away off --session <session id>` and show the outcome as a terminal line.
 - **Agent replies go to the topic.** At the end of each turn step the plugin sends the visible
   answer text, whole, as one message (the service splits long ones at Telegram's limit). Tool
   calls, tool input and thinking never reach the topic. A reply interrupted mid-way (Escape, a
   failed request) is not sent. Sub-agent turns and replies are not sent either.
+- **Questions in the topic.** A `PreToolUse` hook on `AskUserQuestion` runs
+  `telegram-bridge hook ask`: away mode is on — the question with its options reaches the topic and
+  the answer comes back as an ordinary message from you; the mode is off or the service is missing —
+  the question stays in the terminal and a line in the error stream names why.
 - **Turn boundaries and context usage.** On turn start and turn end the plugin tells the service
   the turn id, so the topic shows "typing…" while the session works, and the share of the context
   window in use, which the service puts into the topic's pinned line. When the client has no number
@@ -41,14 +50,11 @@ failure goes to the debug log.
 ### What lives in the service, not in this plugin
 
 - **Away mode — `/away [topic name]` and `/here`.** The mode is kept by the service. Typed in the
-  session's Telegram topic, the service handles these commands itself. To switch the mode from the
-  Claude Code terminal you need a command or skill of your own that runs
-  `telegram-bridge away on [topic name] --session <session id>` /
-  `telegram-bridge away off --session <session id>`; this plugin does not ship one.
-- **`AskUserQuestion` in the topic.** Questions with options reach the topic through a `PreToolUse`
-  hook on `AskUserQuestion` that runs `telegram-bridge hook ask`; the answer comes back as an
-  ordinary message from you. This hook is not part of the plugin either: add it to your own
-  settings if you want it.
+  session's Telegram topic, the service handles these commands itself; the terminal side is the
+  plugin's own `/telegram-bridge:away` and `/telegram-bridge:here` commands (see above).
+- **`AskUserQuestion` in the topic.** Questions with options reach the topic through the plugin's
+  `PreToolUse` hook on `AskUserQuestion`; the answer comes back as an ordinary message from you
+  (see above).
 - Topic naming, the pinned line, the 👀 "received by the bridge" mark, the inbox that survives
   restarts, and filtering of who may write (only the configured owner) are all done by the service.
 
@@ -101,7 +107,8 @@ Check with `/plugin`: `telegram-bridge` from `claude-telegram-bridge` is listed 
 
 ```bash
 claude plugin validate .     # manifests, the hooks module and its calls
-claude plugin test .         # the plugin's tests (tests/mod.test.ts)
+claude plugin test .         # the hooks module's tests (tests/*.test.ts)
+node --test tests/hooks.test.mjs  # the declared hooks file (tests/hooks.test.mjs)
 claude --plugin-dir .        # a session with the plugin from this checkout
 ```
 
