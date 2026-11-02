@@ -29,6 +29,15 @@ const PATH_NAME = '/name'
  */
 const BINARY = 'telegram-bridge'
 
+/**
+ * Имена команд режима, которые регистрирует мод. Клиент зовёт их `/<имя>`: имя регистрации — само
+ * название команды, без имени плагина впереди (`/away`, `/here`), и оно же — имя в хуке
+ * `command.run`. Те же две команды у плагина OpenCode: владелец набирает одно и то же в обоих
+ * клиентах.
+ */
+const COMMAND_AWAY = 'away'
+const COMMAND_HERE = 'here'
+
 /** Событие подкоманды `link`: один объект JSON в строке её стандартной выдачи. */
 type Linked = {
   event?: string
@@ -367,6 +376,111 @@ const take = async ($: EngineInterface, line: string): Promise<void> => {
 }
 
 /**
+ * call зовёт подкоманду моста коротким вызовом и отдаёт её исход: код возврата, стандартную выдачу
+ * и поток ошибок. Долгим он не бывает: `away on|off` живёт один запрос.
+ */
+const call = async (
+  $: EngineInterface,
+  argv: string[],
+): Promise<{ code: number | null; out: string; err: string }> => {
+  const child = $.process.spawn({ argv })
+
+  let out = ''
+  let err = ''
+
+  for await (const piece of child) {
+    if (piece.stream === 'stderr') {
+      err += piece.text
+
+      continue
+    }
+
+    out += piece.text
+  }
+
+  const ended = await child.result
+
+  return { code: ended.code, out, err }
+}
+
+/**
+ * switched зовёт `telegram-bridge away on|off --session <id>` и собирает строку исхода для
+ * владельца. Задание модели этим не выдаётся: ответ хука `command.run` без `next` — вывод
+ * команды, а не слово владельца, и хода модели команда не тратит.
+ */
+const switched = async (
+  $: EngineInterface,
+  which: 'on' | 'off',
+  typed: string,
+): Promise<{ text: string }> => {
+  const path = (await $.env.get('DM_TELEGRAM_BRIDGE')) ?? BINARY
+  const name = typed.trim()
+  const argv = [path, 'away', which, ...(which === 'on' && name !== '' ? [name] : []), '--session']
+
+  argv.push(await $.session.id())
+
+  const failed = which === 'on' ? 'режим не включён' : 'режим не снят'
+
+  try {
+    const ended = await call($, argv)
+
+    if (ended.code === 0) {
+      const said = ended.out.trim()
+
+      return {
+        text: said === '' ? (which === 'on' ? 'режим включён' : 'режим снят') : said,
+      }
+    }
+
+    const why = ended.err.trim()
+
+    return {
+      text: `${failed}: ${why === '' ? `away ${which} кончился кодом ${String(ended.code)}` : why}`,
+    }
+  } catch (failure) {
+    return { text: `${failed}: ${reason(failure)}` }
+  }
+}
+
+/**
+ * registered заводит команды режима у клиента. Задание модели у команды своё не появляется:
+ * регистрация только называет её клиенту, а исполняет её хук `command.run` этого же модуля.
+ * `immediate` — команда срабатывает и посреди хода модели: режим включают и тогда, когда агент
+ * работает.
+ */
+const registered = async ($: EngineInterface): Promise<void> => {
+  const wanted = [
+    {
+      name: COMMAND_AWAY,
+      description: 'Telegram: режим «не у компьютера» — реплики и вопросы сессии идут в тему',
+      argumentHint: '[имя темы]',
+    },
+    {
+      name: COMMAND_HERE,
+      description: 'Telegram: снять режим «не у компьютера» — вопросы снова в терминале',
+      argumentHint: '',
+    },
+  ]
+
+  for (const one of wanted) {
+    try {
+      await $.command.register({
+        name: one.name,
+        description: one.description,
+        ...(one.argumentHint === '' ? {} : { argumentHint: one.argumentHint }),
+        immediate: true,
+      })
+    } catch (failure) {
+      // Команда, которой не нашлось места, — не тишина: владелец наберёт `/away` и не поймёт,
+      // почему её нет. Строка идёт в расшифровку сессии и в журнал отладки, но не модели.
+      $.ui.log(`команда /${one.name} не зарегистрирована: ${reason(failure)}`, {
+        to: 'transcript',
+      })
+    }
+  }
+}
+
+/**
  * hold держит подкоманду, пока жива сессия: её цикл и есть жизнь дочернего процесса, поэтому
  * конец цикла гасит соединение. Строки читаются по одной — пустых строк в выдаче нет.
  */
@@ -460,10 +574,21 @@ export const register: Register = on => {
   on('session.start', async ($, event, next) => {
     const started = await next(event)
 
+    await registered($)
     attach($, await $.session.id())
 
     return started
   })
+
+  // Команды режима обслуживает сам мод: ответ без `next` — вывод команды, а не задание модели.
+  // Поэтому `/away` и `/here` не будят модель и не тратят хода, а `immediate` при регистрации
+  // делает их слышными и посреди идущего хода. Слово владельца эти команды не подают: они зовут
+  // короткий вызов службы, как и раньше звали файлы `commands/`.
+  on('command.run', { command: COMMAND_AWAY }, async ($, event) =>
+    switched($, 'on', event.args ?? ''),
+  )
+
+  on('command.run', { command: COMMAND_HERE }, async ($, event) => switched($, 'off', ''))
 
   on('turn.start', async ($, event, next) => {
     // Ход подагента ходом сессии не считается: в теме владелец видит работу самой сессии, а

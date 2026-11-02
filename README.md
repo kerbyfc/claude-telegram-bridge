@@ -23,12 +23,18 @@ to the service for the lifetime of the session, and then:
 - **Commands from the topic run in the session.** A slash command written in the topic (other than
   the ones the service handles itself) is run as if you had typed it in the terminal; the plugin
   waits for the session to be idle instead of holding a turn.
-- **Away mode — `/telegram-bridge:away [topic name]` and `/telegram-bridge:here`.** The mode itself is
-  kept by the service. Typed in the session's Telegram topic, the service handles these commands
-  itself; in the terminal the plugin ships the two commands, which call
-  `telegram-bridge away on [topic name] --session <session id>` and
-  `telegram-bridge away off --session <session id>` and show the outcome as a terminal line. Without
-  a name, the topic is called after the chat (see "The topic's name is the chat's name" below).
+- **Away mode — `/away [topic name]` and `/here`, and they cost no turn.** The mode itself is kept by
+  the service. Typed in the session's Telegram topic, the service handles these commands itself; in
+  the terminal the module registers the two commands at session start
+  (`$.command.register({ name, description, argumentHint, immediate: true })`) and answers them in its
+  own `command.run` hook: the hook calls `telegram-bridge away on [topic name] --session <session id>`
+  or `telegram-bridge away off --session <session id>` and returns its line as the command's output.
+  The answer goes without `next` and without a `context`, so the model is not woken: no request is
+  made, no token is spent, and nothing of the command's own is added to the context. `immediate`
+  makes the command work in the middle of a running turn too. The registered name is the bare
+  `/away` and `/here` — the client adds no plugin prefix, and `/telegram-bridge:away` is not a
+  command any more (an unknown slash command becomes a prompt). Without a name, the topic is called
+  after the chat (see "The topic's name is the chat's name" below).
 - **Agent replies go to the topic.** At the end of each turn step the plugin sends the visible
   answer text, whole, as one message (the service splits long ones at Telegram's limit). Tool
   calls, tool input and thinking never reach the topic. A reply interrupted mid-way (Escape, a
@@ -46,7 +52,7 @@ to the service for the lifetime of the session, and then:
   (`session_title`) and tells it to the service as an ordinary name, on start, on resume and on every
   prompt typed in the terminal. A chat renamed later renames its topic on the next such hook — there
   is no title event in the hooks module API, and the plugin does not read the client's transcript.
-  A name you type, `/telegram-bridge:away <name>` or `/away <name>` in the topic, wins over the
+  A name you type, `/away <name>` in the terminal or `/away <name>` in the topic, wins over the
   chat's name and stays until you give another one. A session without a title falls back to the bound
   topic and `default_topic_name`.
 - **Session end.** On `session.end` (except `/clear`, which keeps the connection) the plugin says
@@ -60,7 +66,7 @@ failure goes to the debug log.
 
 - **Away mode — `/away [topic name]` and `/here`.** The mode is kept by the service. Typed in the
   session's Telegram topic, the service handles these commands itself; the terminal side is the
-  plugin's own `/telegram-bridge:away` and `/telegram-bridge:here` commands (see above).
+  plugin's own `/away` and `/here` commands (see above).
 - **`AskUserQuestion` in the topic.** Questions with options reach the topic through the plugin's
   `PreToolUse` hook on `AskUserQuestion`; the answer comes back as an ordinary message from you
   (see above).

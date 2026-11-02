@@ -977,3 +977,121 @@ test('то же название чата второй раз службе не 
 
   halt()
 })
+
+/**
+ * commands — заготовка движка под командами режима: команда регистрируется, `/away` и `/here`
+ * зовут подкоманду моста, а движок команду не исполняет — её обслуживает сам мод.
+ */
+const commands = (
+  on: On,
+): {
+  registered: Array<{ name: string; immediate?: boolean; argumentHint?: string }>
+  spawned: string[]
+  engineRuns: number
+  submits: number
+  halt: () => void
+} => {
+  const registered: Array<{ name: string; immediate?: boolean; argumentHint?: string }> = []
+  const spawned: string[] = []
+  let engineRuns = 0
+  let submits = 0
+  let halted: (() => void) | undefined
+  const ended = new Promise<void>(resolve => {
+    halted = resolve
+  })
+
+  on('command.register', (_$, event) => {
+    registered.push(event)
+
+    return { value: { command: event.name } }
+  })
+
+  on('process.spawn', async function* (_$, event) {
+    if (event.argv.includes('link')) {
+      yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+      await ended
+
+      return { value: { code: 0, signal: null } }
+    }
+
+    spawned.push(event.argv.join(' '))
+    yield { stream: 'stdout' as const, text: 'режим включён, тема «проба» (7)\n' }
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  // Движок под модом: команду он не исполняет. Позови мод `next`, ответ пришёл бы отсюда, и
+  // команда пошла бы ходом модели.
+  on('command.run', () => {
+    engineRuns += 1
+
+    return { text: 'движок исполнил команду' }
+  })
+
+  on('prompt.submit', () => {
+    submits += 1
+
+    return { text: 'ход модели' }
+  })
+
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+
+  return {
+    registered,
+    spawned,
+    get engineRuns() {
+      return engineRuns
+    },
+    get submits() {
+      return submits
+    },
+    halt: () => halted?.(),
+  }
+}
+
+test('команды режима зарегистрированы на старте и не тратят хода модели', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  const rig = commands(on)
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  expect(rig.registered).toEqual([
+    { name: 'away', description: expect.any(String), argumentHint: '[имя темы]', immediate: true },
+    { name: 'here', description: expect.any(String), immediate: true },
+  ])
+
+  const answer = await $.command.run({ command: 'away', args: 'тема' })
+
+  expect(answer).toEqual({ text: 'режим включён, тема «проба» (7)' })
+  expect(rig.spawned).toEqual(['telegram-bridge away on тема --session s-1'])
+
+  // Ни `next`, ни задания модели: ответ пришёл от мода, движок команду не исполнял. Поля `context`
+  // в ответе нет — в контекст модели команда ничего не кладёт.
+  expect(rig.engineRuns).toBe(0)
+  expect(rig.submits).toBe(0)
+  expect(Object.keys(answer as object)).not.toContain('context')
+
+  rig.halt()
+})
+
+test('/here зовёт снятие режима и тоже не будит модель', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  const rig = commands(on)
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  const answer = await $.command.run({ command: 'here' })
+
+  expect(answer).toEqual({ text: 'режим включён, тема «проба» (7)' })
+  expect(rig.spawned).toEqual(['telegram-bridge away off --session s-1'])
+  expect(rig.engineRuns).toBe(0)
+  expect(rig.submits).toBe(0)
+
+  rig.halt()
+})
