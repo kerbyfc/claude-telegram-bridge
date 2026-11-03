@@ -65,6 +65,12 @@ let front: string | undefined
 let spoken = false
 
 /**
+ * Почему соединения сессии нет. Мост на машине может быть не настроен вовсе, и строка об этом в
+ * каждом чате владельцу ни к чему: он узнаёт причину, когда просит режим, ответом `/away`.
+ */
+let absent: string | undefined
+
+/**
  * Название чата, как его последним назвал клиент, и то, какое из названий уже ушло службе на этом
  * соединении. Служба держит название у себя: имя темы без аргумента берётся из него, а пока оно
  * меняется — тема переименовывается.
@@ -89,6 +95,16 @@ const said = ($: EngineInterface, line: string): void => {
   $.ui.toast(text)
   $.ui.status(text)
   $.ui.log(text, { to: 'transcript' })
+}
+
+/**
+ * unlinked запоминает, почему соединения нет, и не тревожит владельца: режим он не просил.
+ * Первая названная причина точнее той, что придёт следом с концом подкоманды.
+ */
+const unlinked = ($: EngineInterface, line: string): void => {
+  absent ??= line
+
+  $.ui.log(`мост Telegram: ${line}`, { to: 'debug' })
 }
 
 /** head отрезает у строки команды имя: всё после первого пробела — её аргументы. */
@@ -341,7 +357,15 @@ const deliver = async ($: EngineInterface, event: Linked): Promise<void> => {
  * служебной строки моста в сессию от имени владельца не бывает.
  */
 const fault = ($: EngineInterface, event: Linked): void => {
-  said($, event.text ?? 'служба отказала')
+  const text = event.text ?? 'служба отказала'
+
+  if (front === undefined) {
+    unlinked($, text)
+
+    return
+  }
+
+  said($, text)
 }
 
 /** take разбирает одну строку выдачи подкоманды. */
@@ -359,6 +383,7 @@ const take = async ($: EngineInterface, line: string): Promise<void> => {
   switch (event.event) {
     case 'ready':
       front = event.socket
+      absent = undefined
       // Название, запомненное до входа, уходит службе сразу: иначе имя темы без аргумента пришлось
       // бы ждать следующего слова владельца, а его у не у компьютера может не быть вовсе.
       named = ''
@@ -420,6 +445,11 @@ const switched = async (
   argv.push(await $.session.id())
 
   const failed = which === 'on' ? 'режим не включён' : 'режим не снят'
+
+  // Без соединения служба включила бы режим, а слово из темы в сессию не дошло бы.
+  if (which === 'on' && absent !== undefined) {
+    return { text: `${failed}: ${absent}` }
+  }
 
   try {
     const ended = await call($, argv)
@@ -489,9 +519,11 @@ const hold = async ($: EngineInterface, session: string): Promise<void> => {
   const child = $.process.spawn({ argv: [path, 'link', '--session', session] })
 
   let rest = ''
+  let complaint = ''
 
   for await (const piece of child) {
     if (piece.stream === 'stderr') {
+      complaint = piece.text.trim()
       $.ui.log(piece.text.trimEnd(), { to: 'debug' })
 
       continue
@@ -512,6 +544,8 @@ const hold = async ($: EngineInterface, session: string): Promise<void> => {
   const ended = await child.result
   const how = ended.signal === null ? `код ${ended.code}` : `сигнал ${ended.signal}`
 
+  const opened = front !== undefined
+
   // Сокета подкоманды больше нет: сказать в него нечего, и `session.end` после этого `bye` не шлёт.
   front = undefined
 
@@ -520,12 +554,25 @@ const hold = async ($: EngineInterface, session: string): Promise<void> => {
   // Кодом 0 подкоманда кончается только штатно: по `bye` мода или по остановке клиентом, на которой
   // она говорит `bye` сама, — клиент гасит её на выходе раньше, чем зовёт `session.end`. Любой
   // другой конец значит, что канала больше нет: настройки не названы, служба отказала, процесс убит.
-  // Молчать об этом нельзя — в теме владелец увидит только отметку придержанного на своём
-  // сообщении, а причина здесь. Об отказе службы ему уже сказано событием `error`.
-  const finished = ended.code === 0 && ended.signal === null
+  // Молчать о канале, который был и пропал, нельзя — в теме владелец увидит только отметку
+  // придержанного на своём сообщении, а причина здесь. Об отказе службы ему уже сказано событием
+  // `error`. Соединение, которое так и не открылось, — не пропажа: причину назовёт `/away`.
+  if (ended.code === 0 && ended.signal === null) {
+    return
+  }
 
-  if (!finished && !spoken) {
-    said($, `канала нет, соединение кончилось (${how})`)
+  const line = `канала нет, соединение кончилось (${how})`
+
+  if (!opened) {
+    unlinked($, complaint === '' ? line : complaint)
+
+    return
+  }
+
+  absent = line
+
+  if (!spoken) {
+    said($, line)
   }
 }
 
@@ -551,7 +598,7 @@ const farewell = async ($: EngineInterface): Promise<void> => {
 /** attach поднимает соединение сессии, не держа ход: ход кончается, а соединение остаётся. */
 const attach = ($: EngineInterface, session: string): void => {
   void hold($, session).catch((failure: unknown) => {
-    said($, `соединение со службой не поднялось: ${reason(failure)}`)
+    unlinked($, `соединение со службой не поднялось: ${reason(failure)}`)
   })
 }
 

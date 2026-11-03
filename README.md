@@ -7,7 +7,8 @@ replies go to the topic, and what you write in the topic arrives in the session 
 The plugin is only the session-side half. It **does not work on its own**: it talks to a local
 service, [`telegram-bridge`](https://github.com/kerbyfc/telegram-bridge), which polls the Telegram
 Bot API, keeps the topics, sessions and the owner's message inbox, and serves the thin client and the
-session adapters. Without it the plugin loads, finds no channel and says so in the terminal.
+session adapters. Without it the plugin loads and stays quiet; `/away` answers with the reason there
+is no channel.
 
 ## What the plugin does
 
@@ -56,8 +57,11 @@ to the service for the lifetime of the session, and then:
   chat's name and stays until you give another one. A session without a title falls back to the bound
   topic and `default_topic_name`.
 - **Session end.** On `session.end` (except `/clear`, which keeps the connection) the plugin says
-  `bye` to the service. If the connection ends any other way, the terminal shows a
+  `bye` to the service. If an open connection ends any other way, the terminal shows a
   `мост Telegram: …` notice that there is no channel.
+- **A bridge that is not set up is quiet until asked.** A connection that never opened (no binary, no
+  settings, the service refused) shows nothing in a session: the reason goes to the debug log, and
+  `/away` answers `режим не включён: <reason>` without turning the mode on.
 
 Notifications about turns, replies and context never block a turn: they are fire-and-forget, and a
 failure goes to the debug log.

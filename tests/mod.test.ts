@@ -1095,3 +1095,135 @@ test('/here зовёт снятие режима и тоже не будит м�
 
   rig.halt()
 })
+
+/** unlinkedRig — движок, у которого подкоманда `link` соединения не открыла: как именно, решает `link`. */
+const unlinkedRig = (on: On, link: () => AsyncGenerator<{ stream: 'stderr'; text: string }, { code: number }>) => {
+  const noticed: string[] = []
+  const spawned: string[] = []
+
+  on('command.register', (_$, event) => ({ value: { command: event.name } }))
+  on('process.spawn', async function* (_$, event) {
+    if (event.argv.includes('link')) {
+      const { code } = yield* link()
+
+      return { value: { code, signal: null } }
+    }
+
+    spawned.push(event.argv.join(' '))
+
+    return { value: { code: 0, signal: null } }
+  })
+  on('ui.toast', (_$, event) => {
+    noticed.push(event.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', (_$, event) => {
+    noticed.push(event.text)
+
+    return { value: undefined }
+  })
+
+  return { noticed, spawned }
+}
+
+test('не настроен: на старте тихо, причину называет /away и режим не включает', async ($, on) => {
+  mock.env(on, {})
+
+  let done: (() => void) | undefined
+  const finished = new Promise<void>(resolve => {
+    done = resolve
+  })
+
+  bottom(on, text => {
+    if (text.includes('путь к настройкам не назван') && text.startsWith('мост Telegram')) {
+      done?.()
+    }
+  })
+
+  const rig = unlinkedRig(on, async function* () {
+    yield { stream: 'stderr' as const, text: 'telegram-bridge: путь к настройкам не назван\n' }
+
+    return { code: 2 }
+  })
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await finished
+
+  expect(rig.noticed).toEqual([])
+  expect(await $.command.run({ command: 'away', args: '' })).toEqual({
+    text: 'режим не включён: telegram-bridge: путь к настройкам не назван',
+  })
+  expect(rig.spawned).toEqual([])
+})
+
+test('бинаря нет: на старте тихо, причину называет /away', async ($, on) => {
+  mock.env(on, {})
+
+  let done: (() => void) | undefined
+  const finished = new Promise<void>(resolve => {
+    done = resolve
+  })
+
+  bottom(on, text => {
+    if (text.includes('не поднялось')) {
+      done?.()
+    }
+  })
+
+  const rig = unlinkedRig(on, async function* () {
+    throw new Error('ENOENT')
+  })
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await finished
+
+  expect(rig.noticed).toEqual([])
+  expect(await $.command.run({ command: 'away', args: '' })).toEqual({
+    text: expect.stringContaining('режим не включён: соединение со службой не поднялось: '),
+  })
+  expect(rig.spawned).toEqual([])
+})
+
+test('канал был и пропал: владелец слышит сразу, /away режим не включает', async ($, on) => {
+  mock.env(on, {})
+
+  const toasts: string[] = []
+  const spawned: string[] = []
+
+  let told: (() => void) | undefined
+  const heard = new Promise<void>(resolve => {
+    told = resolve
+  })
+
+  bottom(on)
+
+  on('command.register', (_$, event) => ({ value: { command: event.name } }))
+  on('process.spawn', async function* (_$, event) {
+    if (event.argv.includes('link')) {
+      yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+      return { value: { code: 1, signal: null } }
+    }
+
+    spawned.push(event.argv.join(' '))
+
+    return { value: { code: 0, signal: null } }
+  })
+  on('ui.toast', (_$, event) => {
+    toasts.push(event.text)
+    told?.()
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await heard
+
+  expect(toasts).toEqual(['мост Telegram: канала нет, соединение кончилось (код 1)'])
+  expect(await $.command.run({ command: 'away', args: '' })).toEqual({
+    text: 'режим не включён: канала нет, соединение кончилось (код 1)',
+  })
+  expect(spawned).toEqual([])
+})
