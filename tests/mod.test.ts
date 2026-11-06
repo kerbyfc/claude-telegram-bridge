@@ -1545,3 +1545,146 @@ test('реплики без подкоманды между смертью и п
 
   expect(messages).toEqual(['первая'])
 })
+
+test('реплика после срабатывания таймера подъёма и до `ready` ждёт входа, а не теряется', async ($, on) => {
+  mock.env(on, {})
+
+  const clock = mock.clock(on)
+  const messages: string[] = []
+  let spawned = 0
+  let open: (() => void) | undefined
+  const gate = new Promise<void>(resolve => {
+    open = resolve
+  })
+
+  bottom(on)
+  stepping(on, 'между запусками')
+
+  on('process.spawn', async function* () {
+    spawned += 1
+
+    if (spawned === 1) {
+      yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+      return { value: { code: 1, signal: null } }
+    }
+
+    // Второй запуск идёт, а вход ещё не назван.
+    await gate
+    yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+    await new Promise<void>(() => {})
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  on('http.fetch', (_$, event) => {
+    if (event.url.endsWith('/message')) {
+      messages.push(String(body(event.init).text))
+    }
+
+    return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+  })
+
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await clock.advance(5000)
+
+  expect(spawned).toBe(2)
+
+  const stream = $.turn.step({ turnId: 't-1', index: 0, model: 'opus', messageCount: 3 })
+
+  for await (const _piece of stream) {
+    // шаг хода дочитывается до конца
+  }
+
+  await stream.result
+
+  expect(messages).toEqual([])
+
+  open?.()
+  await clock.settle()
+
+  expect(messages).toEqual(['между запусками'])
+})
+
+/** resumed — стенд перепривязки: подкоманда каждой сессии живёт, пока мод не скажет ей `bye`. */
+const resumed = (on: On): { argv: string[]; byes: () => number } => {
+  const argv: string[] = []
+  const ends: Array<() => void> = []
+  let byes = 0
+
+  bottom(on)
+  on('classic.SessionStart', () => ({}))
+
+  on('process.spawn', async function* (_$, event) {
+    argv.push(event.argv.join(' '))
+
+    const ended = new Promise<void>(resolve => {
+      ends.push(resolve)
+    })
+
+    yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+    await ended
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  on('http.fetch', (_$, event) => {
+    if (event.url.endsWith('/bye')) {
+      byes += 1
+      ends.shift()?.()
+    }
+
+    return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+  })
+
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+
+  return { argv, byes: () => byes }
+}
+
+test('/resume внутри процесса: прежней сессии `bye`, подкоманда переезжает на новую', async ($, on) => {
+  mock.env(on, {})
+
+  const clock = mock.clock(on)
+  const rig = resumed(on)
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.session.end({ reason: 'resume', sessionId: 's-1', resume: { sessionId: 's-1' } })
+  await clock.settle()
+  await $.classic.SessionStart({ source: 'resume', session_id: 's-2' })
+  await clock.settle()
+
+  expect(rig.argv).toEqual([
+    'telegram-bridge link --session s-1',
+    'telegram-bridge link --session s-2',
+  ])
+  expect(rig.byes()).toBe(1)
+})
+
+test('/resume, о котором клиент сказал раньше конца прежней сессии: новая сессия `bye` не получает', async ($, on) => {
+  mock.env(on, {})
+
+  const clock = mock.clock(on)
+  const rig = resumed(on)
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.classic.SessionStart({ source: 'resume', session_id: 's-2' })
+  await clock.settle()
+  await $.session.end({ reason: 'resume', sessionId: 's-1', resume: { sessionId: 's-1' } })
+  await clock.settle()
+
+  expect(rig.argv).toEqual([
+    'telegram-bridge link --session s-1',
+    'telegram-bridge link --session s-2',
+  ])
+  expect(rig.byes()).toBe(1)
+})

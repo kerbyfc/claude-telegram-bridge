@@ -76,6 +76,12 @@ to the service for the lifetime of the session, and then:
   поднялся: …`). The pending restart is dropped at session end, and a second subcommand is never
   started beside a running one. A refusal that a new connection cannot cure (another major version of the contract, the
   session's connection taken over by another holder) is said and not retried.
+- **`/resume` inside a running client.** The client ends the current session (`session.end` with
+  `resume`) and goes on under another session id in the same process; the hooks module gets no new
+  `session.start`. The plugin follows the classic `SessionStart` hook with `source: resume`: the old
+  session is told `bye`, and a new `telegram-bridge link` holds the resumed session. The end of a
+  session the subcommand no longer holds says no `bye`, so the order of the two events does not matter.
+  `/clear` keeps the connection under the old id, as before.
 - **Reloading the plugin.** A reload that changes the hooks module stops the old subcommand, which
   says `bye`, and `session.start` of the new module starts a new one at once: the session comes back
   with its topic and away mode (`revived`). `/reload-plugins` with an unchanged module does not touch

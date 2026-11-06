@@ -84,6 +84,15 @@ let refused = false
 /** Подкоманда идёт: второй держатель сессии рядом с живым не поднимается. */
 let alive = false
 
+/** Подкоманда хоть раз открыла соединение: о репликах, не дождавшихся её, есть что сказать. */
+let everOpened = false
+
+/** Сессия, которую держит подкоманда: `/resume` внутри процесса меняет её на другую. */
+let linkedSession: string | undefined
+
+/** Цикл текущей подкоманды: перепривязка к другой сессии дожидается его конца. */
+let holding: Promise<void> | undefined
+
 /** Отложенный подъём подкоманды: снимается новым стартом и концом сессии. */
 let respawning: Timer | undefined
 
@@ -336,8 +345,9 @@ const reply = ($: EngineInterface, answered: { answer: string; stopReason: unkno
     return
   }
 
-  // Подкоманда умерла и поднимается заново: реплика ждёт её входа, а не теряется молча.
-  if (front === undefined && respawning !== undefined) {
+  // Входа подкоманды нет: она поднимается заново (таймер ещё идёт или уже сработал, а `ready`
+  // не пришёл) — реплика ждёт её входа, а не теряется молча.
+  if (front === undefined && (respawning !== undefined || alive)) {
     waiting.push(text)
 
     if (waiting.length > WAITING_KEPT) {
@@ -532,6 +542,7 @@ const take = async ($: EngineInterface, line: string): Promise<void> => {
       absent = undefined
       // Название, запомненное до входа, уходит службе сразу: иначе имя темы без аргумента пришлось
       // бы ждать следующего слова владельца, а его у не у компьютера может не быть вовсе.
+      everOpened = true
       named = ''
       speakName($)
       release($)
@@ -804,7 +815,9 @@ const attach = ($: EngineInterface, session: string): void => {
     return
   }
 
-  void hold($, session).then(
+  linkedSession = session
+
+  holding = hold($, session).then(
     (respawn: boolean) => {
       if (respawn) {
         respawning = $.clock.after(RESPAWN_PAUSE_MS, () => {
@@ -830,6 +843,29 @@ const attach = ($: EngineInterface, session: string): void => {
   )
 }
 
+/**
+ * rebind перепривязывает подкоманду к другой сессии того же процесса: `/resume` внутри клиента
+ * кончает прежнюю сессию (`session.end` с `resume`) и продолжает процесс под другим id, а нового
+ * `session.start` модулю не бывает. Прежней службе говорится `bye`, и новая подкоманда держит уже
+ * новую сессию.
+ */
+const rebind = async ($: EngineInterface, session: string): Promise<void> => {
+  if (linkedSession === undefined || linkedSession === session) {
+    return
+  }
+
+  forget()
+
+  if (alive) {
+    await farewell($)
+  }
+
+  await holding
+
+  $.ui.log(`подкоманда моста перепривязана к сессии ${session}`, { to: 'debug' })
+  attach($, session)
+}
+
 /** forget снимает отложенный подъём подкоманды. */
 const forget = (): void => {
   respawning?.cancel()
@@ -840,6 +876,14 @@ const forget = (): void => {
 const lose = ($: EngineInterface): void => {
   const count = waiting.splice(0).length
 
+  // Мост, который ни разу не открыл соединения, не настроен: владелец о нём не тревожится, причину
+  // назовёт `/away`.
+  if (count > 0 && !everOpened) {
+    $.ui.log(`реплик агента не доставлено: ${count} — соединения со службой не было`, { to: 'debug' })
+
+    return
+  }
+
   if (count > 0) {
     warned($, `реплик агента не доставлено в тему: ${count} — подкоманда моста не поднялась`)
   }
@@ -849,8 +893,14 @@ export const register: Register = on => {
   // Название чата клиент называет входом классического хука, а не событием модуля: у
   // `session.start` его нет. Первое название приходит на старте и возврате сессии, дальше — со
   // словом владельца, набранным в терминале, и переименование чата видно на следующем.
-  on('classic.SessionStart', ($, event, next) => {
+  on('classic.SessionStart', async ($, event, next) => {
     name($, event.session_title)
+
+    // `/resume` внутри процесса: клиент продолжает работу под другой сессией, а `session.start`
+    // модулю не повторяет. Подкоманда переезжает на новую сессию сама.
+    if (event.source === 'resume' && typeof event.session_id === 'string') {
+      await rebind($, event.session_id)
+    }
 
     return next(event)
   })
@@ -936,7 +986,10 @@ export const register: Register = on => {
     // насовсем, и слово владельца перестало бы доходить до конца работы клиента. Поэтому на
     // `clear` соединение остаётся, и служба знает сессию под прежним id; сверки id с текущим мод
     // пока не делает.
-    if (event.reason !== 'clear') {
+    //
+    // Конец сессии, которую подкоманда уже не держит (перепривязка на `/resume` успела раньше),
+    // `bye` не говорит: он похоронил бы новую сессию.
+    if (event.reason !== 'clear' && (linkedSession === undefined || event.sessionId === linkedSession)) {
       forget()
       await farewell($)
     }
