@@ -1,5 +1,5 @@
 import type { HttpInit, On } from 'claude-code'
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock, test, type TestBody } from 'claude-code/testing'
 
 /** Сокет местного входа, который подкоманда называет событием готовности. */
 const SOCKET = '/tmp/dmtg-test/l.sock'
@@ -444,36 +444,154 @@ test('выход клиента: подкоманда погашена рань�
   expect(logged).toContain('конец сессии мод не говорит: соединения со службой нет')
 })
 
-test('подкоманда кончилась отказом — владелец слышит, что канала нет', async ($, on) => {
+test('подкоманда умерла не по `bye` — владелец слышит, что канала нет, и она поднимается снова', async ($, on) => {
   mock.env(on, {})
 
+  const clock = mock.clock(on)
   const toasts: string[] = []
-
-  let told: (() => void) | undefined
-  const heard = new Promise<void>(resolve => {
-    told = resolve
-  })
+  const statuses: (string | undefined)[] = []
+  const spawned: string[] = []
 
   bottom(on)
 
-  on('process.spawn', async function* () {
+  // Первый запуск умирает с кодом 1 — так кончается убитый или упавший процесс; второй открывает
+  // соединение и живёт.
+  on('process.spawn', async function* (_$, event) {
+    spawned.push(event.argv.join(' '))
+
     yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+    if (spawned.length === 1) {
+      return { value: { code: 1, signal: null } }
+    }
+
+    await new Promise<void>(() => {})
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  on('ui.toast', (_$, event) => {
+    toasts.push(event.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', (_$, event) => {
+    statuses.push(event.text)
+
+    return { value: undefined }
+  })
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+
+  expect(toasts).toEqual(['мост Telegram: канала нет, соединение кончилось (код 1); поднимаю заново'])
+  expect(spawned.length).toBe(1)
+
+  // До паузы новый запуск не идёт: бинарь, которого нет, не крутился бы вхолостую.
+  await clock.advance(4999)
+  expect(spawned.length).toBe(1)
+
+  await clock.advance(1)
+
+  expect(spawned).toEqual([
+    'telegram-bridge link --session s-1',
+    'telegram-bridge link --session s-1',
+  ])
+  expect(toasts).toEqual([
+    'мост Telegram: канала нет, соединение кончилось (код 1); поднимаю заново',
+    'мост Telegram: канал вернулся',
+  ])
+  expect(statuses.at(-1)).toBeUndefined()
+})
+
+test('отказ службы событием `error` подкоманду заново не поднимает: второй держатель отбирал бы сессию', async ($, on) => {
+  mock.env(on, {})
+
+  const clock = mock.clock(on)
+  const toasts: string[] = []
+  let spawned = 0
+
+  bottom(on)
+
+  const fault = JSON.stringify({
+    event: 'error',
+    code: 'bad-request',
+    text: 'соединение больше не держит сессию',
+  })
+
+  on('process.spawn', async function* () {
+    spawned += 1
+
+    yield { stream: 'stdout' as const, text: `${ready}\n${fault}\n` }
 
     return { value: { code: 1, signal: null } }
   })
 
   on('ui.toast', (_$, event) => {
     toasts.push(event.text)
-    told?.()
 
     return { value: undefined }
   })
   on('ui.status', () => ({ value: undefined }))
 
   await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
-  await heard
+  await clock.settle()
+  await clock.advance(60_000)
 
-  expect(toasts).toEqual(['мост Telegram: канала нет, соединение кончилось (код 1)'])
+  expect(spawned).toBe(1)
+  expect(toasts).toEqual(['мост Telegram: соединение больше не держит сессию'])
+})
+
+/** Test — `$`, каким его держит тело теста. */
+type Test = Parameters<TestBody>[0]
+
+/**
+ * streamed — подкоманда одна на всё время: потерю связи со службой она переживает сама и говорит о
+ * ней событиями, а сама не кончается. Отвечает тостами, которые за это время услышал владелец.
+ */
+const streamed = async ($: Test, on: On, lines: string[]): Promise<string[]> => {
+  mock.env(on, {})
+
+  const clock = mock.clock(on)
+  const toasts: string[] = []
+
+  bottom(on)
+
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout' as const, text: lines.map(line => `${line}\n`).join('') }
+
+    await new Promise<void>(() => {})
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  on('ui.toast', (_$, event) => {
+    toasts.push(event.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+
+  return toasts
+}
+
+/** lost — подкоманда потеряла связь со службой и звонит снова. */
+const lost = JSON.stringify({ event: 'lost', text: 'соединение со службой потеряно' })
+
+test('штатный перезапуск службы проходит молча: потеря связи и возврат владельцу не говорятся', async ($, on) => {
+  expect(await streamed($, on, [ready, lost, ready])).toEqual([])
+})
+
+test('долгая пропажа службы слышна владельцу, а возврат снимает сказанное', async ($, on) => {
+  const absent = JSON.stringify({ event: 'absent', text: 'службы нет 30 с, жду её и подключусь сам' })
+
+  expect(await streamed($, on, [ready, lost, absent, ready])).toEqual([
+    'мост Telegram: службы нет 30 с, жду её и подключусь сам',
+    'мост Telegram: канал вернулся',
+  ])
 })
 
 test('границы хода и процент контекста уходят службе одним путём', async ($, on) => {
@@ -1187,6 +1305,8 @@ test('бинаря нет: на старте тихо, причину назыв
 
 test('канал был и пропал: владелец слышит сразу, /away режим не включает', async ($, on) => {
   mock.env(on, {})
+  // Часы стоят: новый запуск подкоманды через паузу этот тест не смотрит.
+  mock.clock(on)
 
   const toasts: string[] = []
   const spawned: string[] = []
@@ -1221,7 +1341,7 @@ test('канал был и пропал: владелец слышит сраз�
   await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   await heard
 
-  expect(toasts).toEqual(['мост Telegram: канала нет, соединение кончилось (код 1)'])
+  expect(toasts).toEqual(['мост Telegram: канала нет, соединение кончилось (код 1); поднимаю заново'])
   expect(await $.command.run({ command: 'away', args: '' })).toEqual({
     text: 'режим не включён: канала нет, соединение кончилось (код 1)',
   })

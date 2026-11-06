@@ -57,8 +57,22 @@ to the service for the lifetime of the session, and then:
   chat's name and stays until you give another one. A session without a title falls back to the bound
   topic and `default_topic_name`.
 - **Session end.** On `session.end` (except `/clear`, which keeps the connection) the plugin says
-  `bye` to the service. If an open connection ends any other way, the terminal shows a
-  `мост Telegram: …` notice that there is no channel.
+  `bye` to the service.
+- **The channel survives a restart of the service.** `telegram-bridge link` keeps the connection
+  itself: when the service stops (an update, `launchctl kickstart -k`, a reboot) the subcommand stays
+  in the same process, dials again every second and greets the service with the same session, which
+  gets its topic and away mode back. A restart that is over within 30 seconds is silent. A longer
+  absence is said once in the terminal (`мост Telegram: службы нет 30 с, жду её и подключусь сам`),
+  and the channel coming back is said too (`мост Telegram: канал вернулся`).
+- **A subcommand that died is started again.** If an open connection's `telegram-bridge link` exits
+  other than by `bye` or a refusal of the service (it was killed, it crashed), the terminal shows a
+  `мост Telegram: канала нет … поднимаю заново` notice and the plugin starts it again after
+  5 seconds. A refusal that a new connection cannot cure (another major version of the contract, the
+  session's connection taken over by another holder) is said and not retried.
+- **Reloading the plugin.** A reload that changes the hooks module stops the old subcommand, which
+  says `bye`, and `session.start` of the new module starts a new one at once: the session comes back
+  with its topic and away mode (`revived`). `/reload-plugins` with an unchanged module does not touch
+  the running subcommand at all.
 - **A bridge that is not set up is quiet until asked.** A connection that never opened (no binary, no
   settings, the service refused) shows nothing in a session: the reason goes to the debug log, and
   `/away` answers `режим не включён: <reason>` without turning the mode on.
@@ -140,4 +154,5 @@ Code comments, test names and the plugin's terminal notices are in Russian.
 
 On Windows there is no signal for the child process: Claude Code stops `telegram-bridge link` with
 `TerminateProcess`, so `bye` is not sent on exit. The service buries the session after its
-reconnect grace period, and the plugin reports that there is no channel.
+reconnect grace period. The service end of the connection is a named pipe; the subcommand dials it
+again after a restart of the service exactly as it dials the Unix socket on macOS.

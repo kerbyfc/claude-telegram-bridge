@@ -61,8 +61,25 @@ type Answered = { ok: boolean; status: number; text: string }
  */
 let front: string | undefined
 
-/** Владельцу о пропавшем канале уже сказано: второй раз одно и то же не говорится. */
+/**
+ * Пауза перед новым запуском подкоманды, которая вышла не по `bye` и не отказом службы. Связь со
+ * службой подкоманда держит сама и в том же процессе; новый запуск нужен только тогда, когда сам
+ * процесс кончился — его убили или он упал.
+ */
+const RESPAWN_PAUSE_MS = 5000
+
+/**
+ * Владельцу о пропавшем канале уже сказано: второй раз одно и то же не говорится, а вернувшееся
+ * соединение снимает сказанное.
+ */
 let spoken = false
+
+/**
+ * Подкоманда этого запуска сказала `error`: отказ, после которого новый запуск не поможет, —
+ * чужая версия контракта или вытеснённое соединение сессии. Поднимать её заново нельзя: второй
+ * держатель отбирал бы сессию у первого по кругу.
+ */
+let refused = false
 
 /**
  * Почему соединения сессии нет. Мост на машине может быть не настроен вовсе, и строка об этом в
@@ -105,6 +122,24 @@ const unlinked = ($: EngineInterface, line: string): void => {
   absent ??= line
 
   $.ui.log(`мост Telegram: ${line}`, { to: 'debug' })
+}
+
+/**
+ * restored говорит владельцу, что канал вернулся, — только если до этого ему было сказано, что
+ * канала нет: штатный перезапуск службы проходит молча, и возврата тогда не говорится.
+ */
+const restored = ($: EngineInterface): void => {
+  if (!spoken) {
+    return
+  }
+
+  spoken = false
+
+  const text = 'мост Telegram: канал вернулся'
+
+  $.ui.toast(text)
+  $.ui.status(undefined)
+  $.ui.log(text, { to: 'transcript' })
 }
 
 /** head отрезает у строки команды имя: всё после первого пробела — её аргументы. */
@@ -359,6 +394,8 @@ const deliver = async ($: EngineInterface, event: Linked): Promise<void> => {
 const fault = ($: EngineInterface, event: Linked): void => {
   const text = event.text ?? 'служба отказала'
 
+  refused = true
+
   if (front === undefined) {
     unlinked($, text)
 
@@ -366,6 +403,26 @@ const fault = ($: EngineInterface, event: Linked): void => {
   }
 
   said($, text)
+}
+
+/**
+ * gone говорит владельцу, что службы нет дольше штатного перезапуска: подкоманда звонит дальше
+ * сама, а владелец знает, что слово из темы пока не дойдёт. Потеря связи короче (`lost`) идёт в
+ * журнал отладки. Соединение, которое ещё ни разу не открылось, владельца не тревожит: причину
+ * назовёт `/away`.
+ */
+const gone = ($: EngineInterface, event: Linked): void => {
+  const text = event.text ?? 'службы нет, жду её'
+
+  if (front === undefined) {
+    unlinked($, text)
+
+    return
+  }
+
+  if (!spoken) {
+    said($, text)
+  }
 }
 
 /** take разбирает одну строку выдачи подкоманды. */
@@ -388,6 +445,7 @@ const take = async ($: EngineInterface, line: string): Promise<void> => {
       // бы ждать следующего слова владельца, а его у не у компьютера может не быть вовсе.
       named = ''
       speakName($)
+      restored($)
       $.ui.log(`соединение со службой открыто: ${event.socket}`, { to: 'debug' })
 
       return
@@ -395,6 +453,8 @@ const take = async ($: EngineInterface, line: string): Promise<void> => {
       return await deliver($, event)
     case 'error':
       return fault($, event)
+    case 'absent':
+      return gone($, event)
     default:
       $.ui.log(`событие соединения ${event.event}: ${event.text ?? ''}`, { to: 'debug' })
   }
@@ -512,11 +572,14 @@ const registered = async ($: EngineInterface): Promise<void> => {
 
 /**
  * hold держит подкоманду, пока жива сессия: её цикл и есть жизнь дочернего процесса, поэтому
- * конец цикла гасит соединение. Строки читаются по одной — пустых строк в выдаче нет.
+ * конец цикла гасит соединение. Строки читаются по одной — пустых строк в выдаче нет. Отвечает,
+ * надо ли поднять подкоманду заново.
  */
-const hold = async ($: EngineInterface, session: string): Promise<void> => {
+const hold = async ($: EngineInterface, session: string): Promise<boolean> => {
   const path = (await $.env.get('DM_TELEGRAM_BRIDGE')) ?? BINARY
   const child = $.process.spawn({ argv: [path, 'link', '--session', session] })
+
+  refused = false
 
   let rest = ''
   let complaint = ''
@@ -552,28 +615,37 @@ const hold = async ($: EngineInterface, session: string): Promise<void> => {
   $.ui.log(`соединение со службой кончилось: ${how}`, { to: 'debug' })
 
   // Кодом 0 подкоманда кончается только штатно: по `bye` мода или по остановке клиентом, на которой
-  // она говорит `bye` сама, — клиент гасит её на выходе раньше, чем зовёт `session.end`. Любой
-  // другой конец значит, что канала больше нет: настройки не названы, служба отказала, процесс убит.
-  // Молчать о канале, который был и пропал, нельзя — в теме владелец увидит только отметку
-  // придержанного на своём сообщении, а причина здесь. Об отказе службы ему уже сказано событием
-  // `error`. Соединение, которое так и не открылось, — не пропажа: причину назовёт `/away`.
+  // она говорит `bye` сама, — клиент гасит её на выходе раньше, чем зовёт `session.end`. Потеря
+  // связи со службой её не кончает: подкоманда звонит снова сама, в том же процессе. Отказ службы
+  // кончает её насовсем, и о нём владельцу уже сказано событием `error`.
   if (ended.code === 0 && ended.signal === null) {
-    return
+    return false
   }
 
   const line = `канала нет, соединение кончилось (${how})`
 
+  // Соединение, которое так и не открылось, — не пропажа, а мост, который не настроен: нет
+  // настроек, служба отказала. Причину назовёт `/away`, а новый запуск того же не исправит.
   if (!opened) {
     unlinked($, complaint === '' ? line : complaint)
 
-    return
+    return false
   }
 
   absent = line
 
-  if (!spoken) {
-    said($, line)
+  if (refused) {
+    return false
   }
+
+  // Канал был и пропал вместе с процессом: его убили или он упал. Молчать об этом нельзя — в теме
+  // владелец увидит только отметку придержанного на своём сообщении, — и подкоманда поднимается
+  // заново, а вернувшийся канал снимет сказанное.
+  if (!spoken) {
+    said($, `${line}; поднимаю заново`)
+  }
+
+  return true
 }
 
 /** farewell говорит службе, что сессия кончилась: хоронит её служба сама. */
@@ -595,11 +667,23 @@ const farewell = async ($: EngineInterface): Promise<void> => {
   }
 }
 
-/** attach поднимает соединение сессии, не держа ход: ход кончается, а соединение остаётся. */
+/**
+ * attach поднимает соединение сессии, не держа ход: ход кончается, а соединение остаётся.
+ * Подкоманда, у которой канал был и пропал вместе с процессом, поднимается снова после паузы.
+ * Пауза идёт таймером модуля: перезагрузка мода снимает его вместе с прежним окружением, и прежний
+ * модуль второго держателя сессии рядом с новым не поднимет.
+ */
 const attach = ($: EngineInterface, session: string): void => {
-  void hold($, session).catch((failure: unknown) => {
-    unlinked($, `соединение со службой не поднялось: ${reason(failure)}`)
-  })
+  void hold($, session).then(
+    (respawn: boolean) => {
+      if (respawn) {
+        $.clock.after(RESPAWN_PAUSE_MS, () => attach($, session))
+      }
+    },
+    (failure: unknown) => {
+      unlinked($, `соединение со службой не поднялось: ${reason(failure)}`)
+    },
+  )
 }
 
 export const register: Register = on => {
