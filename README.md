@@ -63,11 +63,18 @@ to the service for the lifetime of the session, and then:
   in the same process, dials again every second and greets the service with the same session, which
   gets its topic and away mode back. A restart that is over within 30 seconds is silent. A longer
   absence is said once in the terminal (`мост Telegram: службы нет 30 с, жду её и подключусь сам`),
-  and the channel coming back is said too (`мост Telegram: канал вернулся`).
+  and the channel coming back is said too (`мост Telegram: канал вернулся`) — once the connection
+  has lived 10 seconds, so a service crashing right after the greeting does not flood the terminal.
+  Your word handed out before the restart is not submitted twice: the plugin remembers the deliveries
+  it accepted and only confirms a repeat. Agent replies written while the service or the subcommand
+  is gone wait and reach the topic in order; a reply that cannot be delivered is said in the
+  terminal (`мост Telegram: реплик агента не доставлено в тему: …`).
 - **A subcommand that died is started again.** If an open connection's `telegram-bridge link` exits
   other than by `bye` or a refusal of the service (it was killed, it crashed), the terminal shows a
   `мост Telegram: канала нет … поднимаю заново` notice and the plugin starts it again after
-  5 seconds. A refusal that a new connection cannot cure (another major version of the contract, the
+  5 seconds; a restart that does not open a connection is said too (`мост Telegram: канал не
+  поднялся: …`). The pending restart is dropped at session end, and a second subcommand is never
+  started beside a running one. A refusal that a new connection cannot cure (another major version of the contract, the
   session's connection taken over by another holder) is said and not retried.
 - **Reloading the plugin.** A reload that changes the hooks module stops the old subcommand, which
   says `bye`, and `session.start` of the new module starts a new one at once: the session comes back

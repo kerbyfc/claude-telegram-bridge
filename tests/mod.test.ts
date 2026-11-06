@@ -7,6 +7,9 @@ const SOCKET = '/tmp/dmtg-test/l.sock'
 /** Провенанс доставки: готовая строка, которую мод приклеивает к подаче. */
 const PROVENANCE = 'Доставлено из Telegram, автор Александр, человек'
 
+/** steady — соединение прожило срок: связь вернулась всерьёз. */
+const steady = JSON.stringify({ event: 'steady' })
+
 /** ready — событие открытого соединения сессии. */
 const ready = JSON.stringify({ event: 'ready', socket: SOCKET, mode: 'on', topic_name: 'tg-inventory' })
 
@@ -459,11 +462,13 @@ test('подкоманда умерла не по `bye` — владелец с�
   on('process.spawn', async function* (_$, event) {
     spawned.push(event.argv.join(' '))
 
-    yield { stream: 'stdout' as const, text: `${ready}\n` }
-
     if (spawned.length === 1) {
+      yield { stream: 'stdout' as const, text: `${ready}\n` }
+
       return { value: { code: 1, signal: null } }
     }
+
+    yield { stream: 'stdout' as const, text: `${ready}\n${steady}\n` }
 
     await new Promise<void>(() => {})
 
@@ -581,14 +586,15 @@ const streamed = async ($: Test, on: On, lines: string[]): Promise<string[]> => 
 /** lost — подкоманда потеряла связь со службой и звонит снова. */
 const lost = JSON.stringify({ event: 'lost', text: 'соединение со службой потеряно' })
 
+/** absent — службы нет дольше штатного перезапуска. */
+const absent = JSON.stringify({ event: 'absent', text: 'службы нет 30 с, жду её и подключусь сам' })
+
 test('штатный перезапуск службы проходит молча: потеря связи и возврат владельцу не говорятся', async ($, on) => {
   expect(await streamed($, on, [ready, lost, ready])).toEqual([])
 })
 
 test('долгая пропажа службы слышна владельцу, а возврат снимает сказанное', async ($, on) => {
-  const absent = JSON.stringify({ event: 'absent', text: 'службы нет 30 с, жду её и подключусь сам' })
-
-  expect(await streamed($, on, [ready, lost, absent, ready])).toEqual([
+  expect(await streamed($, on, [ready, lost, absent, ready, steady])).toEqual([
     'мост Telegram: службы нет 30 с, жду её и подключусь сам',
     'мост Telegram: канал вернулся',
   ])
@@ -1346,4 +1352,196 @@ test('канал был и пропал: владелец слышит сраз�
     text: 'режим не включён: канала нет, соединение кончилось (код 1)',
   })
   expect(spawned).toEqual([])
+})
+
+test('петля падений службы сразу после приветствия: одна строка о пропаже, без «канал вернулся» по кругу', async ($, on) => {
+  expect(await streamed($, on, [ready, lost, absent, ready, lost, ready, lost, ready])).toEqual([
+    'мост Telegram: службы нет 30 с, жду её и подключусь сам',
+  ])
+})
+
+test('реплика, не дошедшая до темы, слышна владельцу в терминале', async ($, on) => {
+  const undelivered = JSON.stringify({
+    event: 'undelivered',
+    text: 'реплик агента не доставлено в тему: 1 — служба отбила реплику',
+  })
+
+  expect(await streamed($, on, [ready, undelivered])).toEqual([
+    'мост Telegram: реплик агента не доставлено в тему: 1 — служба отбила реплику',
+  ])
+})
+
+test('повтор принятой доставки в сессию второй раз не подаётся, а подтверждается', async ($, on) => {
+  mock.env(on, {})
+  mock.clock(on)
+  bottom(on)
+
+  const submitted: string[] = []
+  const acks: acked[] = []
+
+  let both: (() => void) | undefined
+  const confirmed = new Promise<void>(resolve => {
+    both = resolve
+  })
+
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout' as const, text: `${ready}\n${word}\n${word}\n` }
+
+    await new Promise<void>(() => {})
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  on('prompt.submit', (_$, event) => {
+    submitted.push(event.text)
+
+    return { text: event.text }
+  })
+
+  on('http.fetch', (_$, event) => {
+    if (event.url.endsWith('/ack')) {
+      acks.push(sent(event.init))
+
+      if (acks.length === 2) {
+        both?.()
+      }
+    }
+
+    return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+  })
+
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await confirmed
+
+  expect(submitted.length).toBe(1)
+  expect(acks).toEqual([
+    { delivery_id: 'd-1', outcome: 'accepted', detail: '' },
+    { delivery_id: 'd-1', outcome: 'accepted', detail: '' },
+  ])
+})
+
+test('подъём, не открывший соединение после «поднимаю заново», слышен владельцу', async ($, on) => {
+  mock.env(on, {})
+
+  const clock = mock.clock(on)
+  const toasts: string[] = []
+  let spawned = 0
+
+  bottom(on)
+
+  on('process.spawn', async function* () {
+    spawned += 1
+
+    if (spawned === 1) {
+      yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+      return { value: { code: 1, signal: null } }
+    }
+
+    yield { stream: 'stderr' as const, text: 'telegram-bridge: путь к настройкам не назван\n' }
+
+    return { value: { code: 2, signal: null } }
+  })
+
+  on('ui.toast', (_$, event) => {
+    toasts.push(event.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await clock.advance(5000)
+  await clock.advance(60_000)
+
+  expect(spawned).toBe(2)
+  expect(toasts).toEqual([
+    'мост Telegram: канала нет, соединение кончилось (код 1); поднимаю заново',
+    'мост Telegram: канал не поднялся: telegram-bridge: путь к настройкам не назван',
+  ])
+})
+
+test('конец сессии снимает отложенный подъём подкоманды', async ($, on) => {
+  mock.env(on, {})
+
+  const clock = mock.clock(on)
+  let spawned = 0
+
+  bottom(on)
+
+  on('process.spawn', async function* () {
+    spawned += 1
+    yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+    return { value: { code: 1, signal: null } }
+  })
+
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 's-1', resume: { sessionId: 's-1' } })
+  await clock.advance(60_000)
+
+  expect(spawned).toBe(1)
+})
+
+test('реплики без подкоманды между смертью и подъёмом уходят новой подкоманде по порядку', async ($, on) => {
+  mock.env(on, {})
+
+  const clock = mock.clock(on)
+  const messages: string[] = []
+  let spawned = 0
+
+  bottom(on)
+  stepping(on, 'первая')
+
+  on('process.spawn', async function* () {
+    spawned += 1
+
+    if (spawned === 1) {
+      yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+      return { value: { code: 1, signal: null } }
+    }
+
+    yield { stream: 'stdout' as const, text: `${ready}\n` }
+
+    await new Promise<void>(() => {})
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  on('http.fetch', (_$, event) => {
+    if (event.url.endsWith('/message')) {
+      messages.push(String(body(event.init).text))
+    }
+
+    return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+  })
+
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+
+  const stream = $.turn.step({ turnId: 't-1', index: 0, model: 'opus', messageCount: 3 })
+
+  for await (const _piece of stream) {
+    // шаг хода дочитывается до конца
+  }
+
+  await stream.result
+
+  expect(messages).toEqual([])
+
+  await clock.advance(5000)
+
+  expect(messages).toEqual(['первая'])
 })

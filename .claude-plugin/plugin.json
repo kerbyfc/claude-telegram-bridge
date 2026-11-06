@@ -1,6 +1,6 @@
 {
   "name": "telegram-bridge",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Мост Telegram: слово владельца приходит в сессию новым ходом, команда из темы исполняется как набранная владельцем",
   "author": {
     "name": "kerbyfc"

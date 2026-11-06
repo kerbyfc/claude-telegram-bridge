@@ -1,4 +1,4 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 /**
  * Мод моста Telegram: держит соединение сессии со службой, подаёт слово владельца в сессию новым
@@ -81,6 +81,37 @@ let spoken = false
  */
 let refused = false
 
+/** Подкоманда идёт: второй держатель сессии рядом с живым не поднимается. */
+let alive = false
+
+/** Отложенный подъём подкоманды: снимается новым стартом и концом сессии. */
+let respawning: Timer | undefined
+
+/**
+ * Этот запуск подкоманды — подъём после смерти прежней, о которой владельцу сказано «поднимаю
+ * заново»: не открыл он соединение — владелец узнаёт и об этом, а не остаётся с обещанием.
+ */
+let revival = false
+
+/**
+ * Доставки, которые мод уже подал и принял. Служба подаёт запись заново, пока не услышала
+ * подтверждения, — после перезапуска службы или подкоманды посреди подачи. Повтор не подаётся в
+ * сессию второй раз: мод подтверждает его принятым и только.
+ */
+const accepted = new Set<string>()
+
+/** Сколько принятых доставок мод помнит: повтор приходит сразу за перезапуском, а не через сотни. */
+const ACCEPTED_KEPT = 256
+
+/**
+ * Реплики агента, пришедшие, пока подкоманды нет между смертью и подъёмом: они уходят новой
+ * подкоманде, как только она откроет вход, в порядке прихода.
+ */
+const waiting: string[] = []
+
+/** Сколько реплик мод копит без подкоманды; сверх — старейшая теряется, и владелец узнаёт. */
+const WAITING_KEPT = 64
+
 /**
  * Почему соединения сессии нет. Мост на машине может быть не настроен вовсе, и строка об этом в
  * каждом чате владельцу ни к чему: он узнаёт причину, когда просит режим, ответом `/away`.
@@ -142,6 +173,30 @@ const restored = ($: EngineInterface): void => {
   $.ui.log(text, { to: 'transcript' })
 }
 
+/**
+ * warned говорит владельцу о потере, которая случилась один раз и сама не вернётся: реплика агента,
+ * не дошедшая до темы. Отметки «сказано» не ставит — это не состояние канала.
+ */
+const warned = ($: EngineInterface, line: string): void => {
+  const text = `мост Telegram: ${line}`
+
+  $.ui.toast(text)
+  $.ui.log(text, { to: 'transcript' })
+}
+
+/** remember запоминает принятую доставку, держа список в пределе. */
+const remember = (delivery: string): void => {
+  accepted.add(delivery)
+
+  if (accepted.size > ACCEPTED_KEPT) {
+    const oldest = accepted.values().next().value
+
+    if (oldest !== undefined) {
+      accepted.delete(oldest)
+    }
+  }
+}
+
 /** head отрезает у строки команды имя: всё после первого пробела — её аргументы. */
 const head = (line: string): { name: string; args: string } => {
   const body = line.trim().replace(/^\/+/, '')
@@ -184,8 +239,12 @@ const confirm = async (
 ): Promise<void> => {
   const socket = front
 
+  // Подкоманды нет — она умерла посреди подачи. Служба подаст запись заново новой подкоманде, и
+  // повтор принятой подтвердится без второй подачи (`accepted`).
   if (socket === undefined) {
-    said($, `приём ${delivery} подтверждать некуда: соединение не назвало свой вход`)
+    $.ui.log(`приём ${delivery} подтверждать некуда: подкоманды нет, подтвердится на повторе`, {
+      to: 'debug',
+    })
 
     return
   }
@@ -277,7 +336,26 @@ const reply = ($: EngineInterface, answered: { answer: string; stopReason: unkno
     return
   }
 
+  // Подкоманда умерла и поднимается заново: реплика ждёт её входа, а не теряется молча.
+  if (front === undefined && respawning !== undefined) {
+    waiting.push(text)
+
+    if (waiting.length > WAITING_KEPT) {
+      waiting.shift()
+      warned($, 'реплика агента не дошла до темы: подкоманды моста нет, а копится не больше 64')
+    }
+
+    return
+  }
+
   notice($, PATH_MESSAGE, { text })
+}
+
+/** release отдаёт новой подкоманде реплики, накопленные без неё, в порядке прихода. */
+const release = ($: EngineInterface): void => {
+  for (const text of waiting.splice(0)) {
+    notice($, PATH_MESSAGE, { text })
+  }
 }
 
 /** told называет процент, не держа ход и не роняя его отказом канала. */
@@ -345,6 +423,7 @@ const word = async ($: EngineInterface, event: Linked): Promise<void> => {
       return
     }
 
+    remember(delivery)
     await confirm($, delivery, 'accepted', '')
   } catch (failure) {
     await confirm($, delivery, 'rejected', `подача не прошла: ${reason(failure)}`)
@@ -367,6 +446,7 @@ const command = async ($: EngineInterface, event: Linked): Promise<void> => {
 
   try {
     await $.command.run({ command: name, args })
+    remember(delivery)
     await confirm($, delivery, 'accepted', '')
   } catch (failure) {
     await confirm($, delivery, 'rejected', `команда не исполнилась: ${reason(failure)}`)
@@ -375,6 +455,15 @@ const command = async ($: EngineInterface, event: Linked): Promise<void> => {
 
 /** deliver разводит доставку по виду. Незнакомый вид в сессию не подаётся. */
 const deliver = async ($: EngineInterface, event: Linked): Promise<void> => {
+  const delivery = event.delivery_id ?? ''
+
+  // Повтор уже принятой доставки — служба не услышала подтверждения: подаётся только подтверждение.
+  if (delivery !== '' && accepted.has(delivery)) {
+    $.ui.log(`доставка ${delivery} уже принята: подтверждаю без второй подачи`, { to: 'debug' })
+
+    return await confirm($, delivery, 'accepted', '')
+  }
+
   if (event.kind === 'owner-message') {
     return await word($, event)
   }
@@ -445,10 +534,16 @@ const take = async ($: EngineInterface, line: string): Promise<void> => {
       // бы ждать следующего слова владельца, а его у не у компьютера может не быть вовсе.
       named = ''
       speakName($)
-      restored($)
+      release($)
       $.ui.log(`соединение со службой открыто: ${event.socket}`, { to: 'debug' })
 
       return
+    case 'steady':
+      // Сказанное о пропаже снимается, когда соединение прожило срок, а не на каждом `ready`:
+      // служба, падающая сразу после приветствия, иначе сыпала бы тостами по кругу.
+      return restored($)
+    case 'undelivered':
+      return warned($, event.text ?? 'реплика агента не дошла до темы')
     case 'delivery':
       return await deliver($, event)
     case 'error':
@@ -580,7 +675,20 @@ const hold = async ($: EngineInterface, session: string): Promise<boolean> => {
   const child = $.process.spawn({ argv: [path, 'link', '--session', session] })
 
   refused = false
+  alive = true
 
+  try {
+    return await held($, child)
+  } finally {
+    alive = false
+  }
+}
+
+/** held читает выдачу подкоманды до её конца и решает, поднимать ли её заново. */
+const held = async (
+  $: EngineInterface,
+  child: ReturnType<EngineInterface['process']['spawn']>,
+): Promise<boolean> => {
   let rest = ''
   let complaint = ''
 
@@ -627,10 +735,22 @@ const hold = async ($: EngineInterface, session: string): Promise<boolean> => {
   // Соединение, которое так и не открылось, — не пропажа, а мост, который не настроен: нет
   // настроек, служба отказала. Причину назовёт `/away`, а новый запуск того же не исправит.
   if (!opened) {
-    unlinked($, complaint === '' ? line : complaint)
+    const why = complaint === '' ? line : complaint
+
+    // Подъём после сказанного «поднимаю заново» не открыл соединения: обещание не сбылось, и
+    // владелец узнаёт об этом, а не ждёт канала, которого не будет.
+    if (revival) {
+      revival = false
+      spoken = false
+      said($, `канал не поднялся: ${why}`)
+    }
+
+    unlinked($, why)
 
     return false
   }
+
+  revival = false
 
   absent = line
 
@@ -644,6 +764,8 @@ const hold = async ($: EngineInterface, session: string): Promise<boolean> => {
   if (!spoken) {
     said($, `${line}; поднимаю заново`)
   }
+
+  revival = true
 
   return true
 }
@@ -674,16 +796,53 @@ const farewell = async ($: EngineInterface): Promise<void> => {
  * модуль второго держателя сессии рядом с новым не поднимет.
  */
 const attach = ($: EngineInterface, session: string): void => {
+  forget()
+
+  if (alive) {
+    $.ui.log('подкоманда моста уже идёт: второй держатель сессии не поднимается', { to: 'debug' })
+
+    return
+  }
+
   void hold($, session).then(
     (respawn: boolean) => {
       if (respawn) {
-        $.clock.after(RESPAWN_PAUSE_MS, () => attach($, session))
+        respawning = $.clock.after(RESPAWN_PAUSE_MS, () => {
+          respawning = undefined
+          attach($, session)
+        })
+      } else {
+        lose($)
       }
     },
     (failure: unknown) => {
-      unlinked($, `соединение со службой не поднялось: ${reason(failure)}`)
+      const why = `соединение со службой не поднялось: ${reason(failure)}`
+
+      if (revival) {
+        revival = false
+        spoken = false
+        said($, `канал не поднялся: ${why}`)
+      }
+
+      lose($)
+      unlinked($, why)
     },
   )
+}
+
+/** forget снимает отложенный подъём подкоманды. */
+const forget = (): void => {
+  respawning?.cancel()
+  respawning = undefined
+}
+
+/** lose говорит о репликах, которые ждали подкоманду, а она так и не поднялась. */
+const lose = ($: EngineInterface): void => {
+  const count = waiting.splice(0).length
+
+  if (count > 0) {
+    warned($, `реплик агента не доставлено в тему: ${count} — подкоманда моста не поднялась`)
+  }
 }
 
 export const register: Register = on => {
@@ -778,6 +937,7 @@ export const register: Register = on => {
     // `clear` соединение остаётся, и служба знает сессию под прежним id; сверки id с текущим мод
     // пока не делает.
     if (event.reason !== 'clear') {
+      forget()
       await farewell($)
     }
 
