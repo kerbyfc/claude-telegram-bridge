@@ -1688,3 +1688,279 @@ test('/resume, о котором клиент сказал раньше конц
   ])
   expect(rig.byes()).toBe(1)
 })
+
+/** Петлевой вход подкоманды там, где сокета у запроса модуля нет: адрес и ключ к нему. */
+const LOOPBACK = 'http://127.0.0.1:47123'
+const TOKEN = 't-петля'
+
+/** door — один запрос мода на местный вход: адрес, сокет и заголовки, как их увидел движок. */
+type door = { url: string; socketPath: string | undefined; headers: Record<string, string> }
+
+/** doors отвечает за `http.fetch` мода и помнит, каким путём ушёл каждый запрос. */
+const doors = (on: On): { sent: door[]; wait: (count: number) => Promise<void> } => {
+  const sent: door[] = []
+  const waiters: Array<{ count: number; resolve: () => void }> = []
+
+  on('http.fetch', (_$, event) => {
+    sent.push({
+      url: event.url,
+      socketPath: event.init?.socketPath,
+      headers: { ...(event.init?.headers ?? {}) } as Record<string, string>,
+    })
+
+    for (const waiter of [...waiters]) {
+      if (sent.length < waiter.count) continue
+
+      waiters.splice(waiters.indexOf(waiter), 1)
+      waiter.resolve()
+    }
+
+    return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+  })
+
+  const wait = async (count: number): Promise<void> => {
+    if (sent.length >= count) return
+
+    await new Promise<void>(resolve => {
+      waiters.push({ count, resolve })
+    })
+  }
+
+  return { sent, wait }
+}
+
+/** hangingOn — подкоманда, которая открыла вход событием `ready` и живёт до конца теста. */
+const hangingOn = (on: On, opened: string): (() => void) => {
+  let halted: (() => void) | undefined
+  const ended = new Promise<void>(resolve => {
+    halted = resolve
+  })
+
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout' as const, text: `${opened}\n` }
+
+    await ended
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+
+  return () => halted?.()
+}
+
+test('вход по петлевому адресу: запрос несёт ключ заголовком и идёт не в сокет', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  on('classic.SessionStart', () => ({}))
+
+  const halt = hangingOn(on, JSON.stringify({ event: 'ready', url: LOOPBACK, token: TOKEN }))
+  const said = doors(on)
+
+  await $.classic.SessionStart({ session_title: CHAT })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await said.wait(1)
+
+  expect(said.sent[0]?.url).toBe(`${LOOPBACK}/name`)
+  expect(said.sent[0]?.socketPath).toBeUndefined()
+  expect(said.sent[0]?.headers.authorization).toBe(`Bearer ${TOKEN}`)
+
+  halt()
+})
+
+test('вход по сокету: запрос идёт в сокет и ключа не несёт', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  on('classic.SessionStart', () => ({}))
+
+  const halt = hangingOn(on, ready)
+  const said = doors(on)
+
+  await $.classic.SessionStart({ session_title: CHAT })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await said.wait(1)
+
+  expect(said.sent[0]?.url).toBe('http://telegram-bridge/name')
+  expect(said.sent[0]?.socketPath).toBe(SOCKET)
+  expect(said.sent[0]?.headers.authorization).toBeUndefined()
+
+  halt()
+})
+
+/** Журнал сессии, путь к которому несёт вход классического хука. */
+const JOURNAL = '/tmp/dmtg-test/s-1.jsonl'
+
+/**
+ * slashed приводит путь, который движок отдал хуку `fs.*`, к виду журнала: на Windows движок
+ * делает из `/tmp/…` абсолютный путь диска с обратными косыми.
+ */
+const slashed = (path: string): string => path.replaceAll('\\', '/').replace(/^[A-Za-z]:/, '')
+
+/** row — строка журнала сессии, как её пишет клиент. */
+const row = (value: Record<string, unknown>): string => `${JSON.stringify(value)}\n`
+
+/**
+ * journaled отвечает за журнал сессии: `$.fs.stat` и `$.fs.read` по его пути. `append` дописывает
+ * строку, как клиент дописывает журнал, — и размер, и время правки меняются; `reads` считает,
+ * сколько раз мод прочитал журнал целиком.
+ */
+const journaled = (on: On, initial: string): { append: (line: string) => void; reads: () => number } => {
+  let text = initial
+  let version = 1
+  let reads = 0
+
+  on('fs.stat', (_$, event) => {
+    expect(slashed(event.path)).toBe(JOURNAL)
+
+    return { value: { kind: 'file' as const, size: text.length, mtimeMs: version, isLink: false } }
+  })
+
+  on('fs.read', (_$, event) => {
+    expect(slashed(event.path)).toBe(JOURNAL)
+    reads += 1
+
+    return { value: text }
+  })
+
+  return {
+    append: (line: string) => {
+      text += line
+      version += 1
+    },
+    reads: () => reads,
+  }
+}
+
+test('имя после /rename без промпта: /away называет службе свежее имя до включения', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  on('classic.SessionStart', () => ({}))
+
+  const rig = commands(on)
+  const book = journaled(on, row({ type: 'user', message: { content: 'привет' } }))
+
+  // Каждый короткий запрос и то, сколько вызовов `away` ушло к его моменту: имя должно опередить
+  // включение, иначе тема без аргумента назвалась бы прежним именем.
+  const sent: called[] = []
+  const before: number[] = []
+  let first: (() => void) | undefined
+  const named = new Promise<void>(resolve => {
+    first = resolve
+  })
+
+  on('http.fetch', (_$, event) => {
+    sent.push({ url: event.url, body: body(event.init) })
+    before.push(rig.spawned.length)
+    first?.()
+
+    return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+  })
+
+  await $.classic.SessionStart({ session_title: CHAT, transcript_path: JOURNAL })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await named
+
+  expect(sent[0]).toEqual({ url: 'http://telegram-bridge/name', body: { name: CHAT } })
+
+  // `/rename` дописал журнал, а промпта не было: хука с `session_title` модуль не видел.
+  book.append(row({ type: 'custom-title', customTitle: 'Проба', sessionId: 's-1' }))
+
+  await $.command.run({ command: 'away' })
+
+  expect(sent.at(-1)).toEqual({ url: 'http://telegram-bridge/name', body: { name: 'Проба' } })
+  expect(before.at(-1)).toBe(0)
+  expect(rig.spawned).toEqual(['telegram-bridge away on --session s-1'])
+
+  rig.halt()
+})
+
+test('опрос журнала переименовывает тему без события хода; автоимя уступает имени владельца', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  on('classic.SessionStart', () => ({}))
+
+  const clock = mock.clock(on)
+  const halt = hanging(on)
+  const said = reporter(on)
+  const book = journaled(on, row({ type: 'ai-title', aiTitle: 'Автоимя', sessionId: 's-1' }))
+
+  await $.classic.SessionStart({ transcript_path: JOURNAL })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await said.wait(1)
+
+  expect(said.sent).toEqual([{ url: 'http://telegram-bridge/name', body: { name: 'Автоимя' } }])
+
+  // Неизменный журнал второй раз не читается: опрос смотрит только размер и время правки.
+  const read = book.reads()
+
+  await clock.advance(5000)
+
+  expect(book.reads()).toBe(read)
+
+  book.append(row({ type: 'custom-title', customTitle: 'Имя владельца', sessionId: 's-1' }))
+  book.append(row({ type: 'ai-title', aiTitle: 'Новое автоимя', sessionId: 's-1' }))
+
+  await clock.advance(4999)
+
+  expect(said.sent.length).toBe(1)
+
+  await clock.advance(1)
+  await said.wait(2)
+
+  expect(said.sent[1]).toEqual({ url: 'http://telegram-bridge/name', body: { name: 'Имя владельца' } })
+
+  halt()
+})
+
+test('/away <имя> называет чат ближайшим UserPromptSubmit, и только им', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  on('classic.UserPromptSubmit', () => ({}))
+
+  const rig = commands(on)
+  const said = reporter(on)
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'away', args: 'Тема владельца' })
+
+  expect(rig.spawned).toEqual(['telegram-bridge away on Тема владельца --session s-1'])
+  expect(said.sent).toEqual([{ url: 'http://telegram-bridge/name', body: { name: 'Тема владельца' } }])
+
+  const first = await $.classic.UserPromptSubmit({ prompt: 'дальше' })
+  const second = await $.classic.UserPromptSubmit({ prompt: 'ещё' })
+
+  expect(first).toEqual(expect.objectContaining({ sessionTitle: 'Тема владельца' }))
+  expect(Object.keys(second as object)).not.toContain('sessionTitle')
+
+  rig.halt()
+})
+
+test('/away без имени название чата не трогает', async ($, on) => {
+  mock.env(on, {})
+  bottom(on)
+
+  on('classic.SessionStart', () => ({}))
+  on('classic.UserPromptSubmit', () => ({}))
+
+  const rig = commands(on)
+  const said = reporter(on)
+
+  await $.classic.SessionStart({ session_title: CHAT })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await said.wait(1)
+  await $.command.run({ command: 'away' })
+
+  const answered = await $.classic.UserPromptSubmit({ prompt: 'дальше' })
+
+  expect(said.sent).toEqual([{ url: 'http://telegram-bridge/name', body: { name: CHAT } }])
+  expect(Object.keys(answered as object)).not.toContain('sessionTitle')
+
+  rig.halt()
+})
