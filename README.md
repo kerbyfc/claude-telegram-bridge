@@ -48,14 +48,30 @@ to the service for the lifetime of the session, and then:
   the turn id, so the topic shows "typing…" while the session works, and the share of the context
   window in use, which the service puts into the topic's pinned line. When the client has no number
   for the context window, nothing is reported.
-- **The topic's name is the chat's name.** Until you name the topic yourself, the topic is called
-  after the chat: the plugin reads the session title the client puts into its classic hook input
-  (`session_title`) and tells it to the service as an ordinary name, on start, on resume and on every
-  prompt typed in the terminal. A chat renamed later renames its topic on the next such hook — there
-  is no title event in the hooks module API, and the plugin does not read the client's transcript.
-  A name you type, `/away <name>` in the terminal or `/away <name>` in the topic, wins over the
-  chat's name and stays until you give another one. A session without a title falls back to the bound
-  topic and `default_topic_name`.
+- **The topic's name is the chat's name.** The topic always carries the chat's name, whoever named
+  the chat: `/rename`, a hook, or the client's automatic title. The hooks module API has no title
+  event and says nothing to a module about `/rename`, so the plugin takes the name from two places:
+  the classic hook input (`session_title`, on start, on resume and on every prompt typed in the
+  terminal) and the session transcript (JSONL) whose path the same input carries
+  (`transcript_path`). In the transcript the name is the last `custom-title` record (`/rename`,
+  hooks, `/away <name>`) or, without one, the last `ai-title` record (the automatic title). The
+  transcript is read on those classic hooks, on turn start and turn end, before `/away`, and every
+  5 seconds while the session lives (`$.clock.every`). Whichever source changed last wins; a new
+  name goes to the service at once (`/name`), and the service renames the topic. A session without
+  any title falls back to the bound topic and `default_topic_name`.
+
+  Cost of the transcript poll: `$.fs.read` returns a file only whole, so the plugin first compares
+  the file's size and modification time (`$.fs.stat`) and skips an unchanged transcript; a changed
+  one is read whole and only the line holding the last title key is parsed. While a turn runs the
+  transcript changes all the time, and the poll reads it whole every 5 seconds. `$.fs.read` refuses
+  files over 4 MiB: on such a transcript the transcript source is silent (a line in the debug log)
+  and the name comes from `session_title` alone.
+- **`/away <name>` renames the chat.** The name goes to `telegram-bridge away on <name> --session
+  <id>` as before, and the plugin also takes it as the chat's name: the topic gets it at once
+  (`/name`), the chat itself on the next prompt — the nearest classic `UserPromptSubmit` answers
+  `sessionTitle: <name>` once (the `command.run` result has no such field). `/away` without a name
+  leaves the chat's name as it is; before turning the mode on it reads the transcript, so a chat
+  renamed without a prompt gives the topic its fresh name.
 - **Session end.** On `session.end` (except `/clear`, which keeps the connection) the plugin says
   `bye` to the service.
 - **The channel survives a restart of the service.** `telegram-bridge link` keeps the connection
@@ -169,3 +185,14 @@ On Windows there is no signal for the child process: Claude Code stops `telegram
 `TerminateProcess`, so `bye` is not sent on exit. The service buries the session after its
 reconnect grace period. The service end of the connection is a named pipe; the subcommand dials it
 again after a restart of the service exactly as it dials the Unix socket on macOS.
+
+### The subcommand's local entry
+
+The plugin's short requests to `telegram-bridge link` (`/name`, `/message`, `/turn/start`,
+`/turn/end`, `/context`, `/ack`, `/bye`) go where the subcommand's `ready` event points. A hooks
+module cannot reach a named pipe (`\\.\pipe\…`: `$.http.fetch` refuses it as a network location),
+so on Windows the subcommand names a loopback address and a key: `url`
+(`http://127.0.0.1:<port>`) and `token`, and each request carries `Authorization: Bearer <token>`.
+On macOS `ready` names `socket` alone, and requests go to the Unix socket (`socketPath`). The plugin
+uses whatever the subcommand named on its platform: `url` with `token` when both are there, else
+`socket`.

@@ -6,12 +6,19 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
  *
  * Сокетов у модуля хуков нет вовсе, поэтому соединение сессии держит подкоманда
  * `telegram-bridge link`: доставку она отдаёт строкой JSON своей стандартной выдачи, а короткий
- * запрос принимает на свой сокет, адрес которого называет событием `ready`. Протокол и роли —
- * контракт службы `telegram-bridge`; служба в этом репозитории не публикуется.
+ * запрос принимает на свой местный вход, который называет событием `ready`: сокетом (`socket`)
+ * или петлевым адресом с ключом (`url` и `token`) — тем, что есть на её площадке. Протокол и роли
+ * — контракт службы `telegram-bridge`; служба в этом репозитории не публикуется.
  */
 
-/** Адрес местного входа подкоманды: имя хоста здесь роли не играет, запрос идёт в сокет. */
+/** Адрес местного входа-сокета: имя хоста здесь роли не играет, запрос идёт в сокет. */
 const FRONT = 'http://telegram-bridge'
+
+/**
+ * Как часто мод заглядывает в журнал сессии за названием чата: о `/rename` движок модулю не
+ * сообщает ничем, и переименование видно только записью журнала.
+ */
+const TITLE_POLL_MS = 5000
 
 /** Пути местного входа — по одному на операцию. Те же пути зовёт плагин OpenCode. */
 const PATH_ACK = '/ack'
@@ -42,6 +49,8 @@ const COMMAND_HERE = 'here'
 type Linked = {
   event?: string
   socket?: string
+  url?: string
+  token?: string
   kind?: string
   delivery_id?: string
   text?: string
@@ -56,10 +65,16 @@ type Outcome = 'accepted' | 'rejected'
 type Answered = { ok: boolean; status: number; text: string }
 
 /**
- * Адрес местного входа подкоманды, как она назвала его событием `ready`. Своё у каждого запуска
- * модуля: перезапуск мода поднимает своё соединение и свой вход.
+ * Местный вход подкоманды, как она назвала его событием `ready`: сокет там, где он есть (macOS), и
+ * петлевой адрес с ключом там, где запрос модуля в именованный канал движок не пускает (Windows).
  */
-let front: string | undefined
+type Front = { socket: string } | { url: string; token: string }
+
+/**
+ * Вход текущей подкоманды. Свой у каждого запуска модуля: перезапуск мода поднимает своё
+ * соединение и свой вход.
+ */
+let front: Front | undefined
 
 /**
  * Пауза перед новым запуском подкоманды, которая вышла не по `bye` и не отказом службы. Связь со
@@ -134,6 +149,34 @@ let absent: string | undefined
  */
 let chat = ''
 let named = ''
+
+/**
+ * Откуда приходит название чата: вход классического хука (`session_title`) и журнал сессии
+ * (`custom-title`, иначе `ai-title`). Каждый источник помнит, что назвал последним, и названием
+ * чата становится то, что сменилось позже: источник, повторяющий прежнее, свежего не перебивает.
+ */
+type Source = 'hook' | 'journal'
+
+const heard: Record<Source, string> = { hook: '', journal: '' }
+
+/**
+ * Журнал сессии (JSONL) — путь из входа классического хука — и метка (размер и время правки), на
+ * которой он прочитан последним: неизменный журнал второй раз не читается.
+ */
+let journal: string | undefined
+let journalMark = ''
+
+/** Чтение журнала идёт: опрос не начинает второе рядом с ним, а ждёт того же. */
+let peeking: Promise<void> | undefined
+
+/** Опрос журнала: идёт, пока жива сессия, и снимается её концом. */
+let polling: Timer | undefined
+
+/**
+ * Имя, которое `/away <имя>` дало чату: ближайший `UserPromptSubmit` отдаёт его клиенту полем
+ * `sessionTitle` один раз — у ответа `command.run` такого поля нет.
+ */
+let retitle: string | undefined
 
 /** reason называет причину отказа строкой, годной для журнала службы. */
 const reason = (failure: unknown): string =>
@@ -217,24 +260,52 @@ const head = (line: string): { name: string; args: string } => {
 }
 
 /**
- * post зовёт местный вход подкоманды по адресу, который она назвала сама. Адрес — довод звонящего:
- * входа может не быть вовсе, и решает это тот, кто знает, что делать без него.
+ * post зовёт местный вход подкоманды тем путём, который она назвала сама: петлевой адрес несёт
+ * ключ заголовком `Authorization`, сокет ключа не требует. Вход — довод звонящего: входа может не
+ * быть вовсе, и решает это тот, кто знает, что делать без него.
  */
 const post = async (
   $: EngineInterface,
-  socket: string,
+  door: Front,
   path: string,
   body: unknown,
 ): Promise<Answered> => {
-  const answered = await $.http.fetch(`${FRONT}${path}`, {
-    method: 'POST',
-    socketPath: socket,
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+  const payload = JSON.stringify(body)
+  const answered =
+    'url' in door
+      ? await $.http.fetch(`${door.url}${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${door.token}` },
+          body: payload,
+        })
+      : await $.http.fetch(`${FRONT}${path}`, {
+          method: 'POST',
+          socketPath: door.socket,
+          headers: { 'content-type': 'application/json' },
+          body: payload,
+        })
 
   return { ok: answered.ok, status: answered.status, text: answered.text }
 }
+
+/**
+ * opened разбирает вход из события `ready`: петлевой адрес, когда подкоманда назвала и его, и
+ * ключ, иначе сокет. Не назвала ни того, ни другого — входа нет.
+ */
+const opened = (event: Linked): Front | undefined => {
+  if (event.url !== undefined && event.url !== '' && event.token !== undefined && event.token !== '') {
+    return { url: event.url, token: event.token }
+  }
+
+  if (event.socket !== undefined && event.socket !== '') {
+    return { socket: event.socket }
+  }
+
+  return undefined
+}
+
+/** where называет вход строкой для журнала отладки — без ключа. */
+const where = (door: Front): string => ('url' in door ? door.url : door.socket)
 
 /**
  * Подтверждение приёма: по нему служба ставит честь на сообщении владельца. Отправка доставки
@@ -246,11 +317,11 @@ const confirm = async (
   outcome: Outcome,
   detail: string,
 ): Promise<void> => {
-  const socket = front
+  const door = front
 
   // Подкоманды нет — она умерла посреди подачи. Служба подаст запись заново новой подкоманде, и
   // повтор принятой подтвердится без второй подачи (`accepted`).
-  if (socket === undefined) {
+  if (door === undefined) {
     $.ui.log(`приём ${delivery} подтверждать некуда: подкоманды нет, подтвердится на повторе`, {
       to: 'debug',
     })
@@ -261,7 +332,7 @@ const confirm = async (
   // Отказ подтверждения — рабочее состояние протокола, а не исключение: рвать им единственный
   // цикл чтения доставок нельзя, иначе клиент погасит дочерний процесс вместе с каналом.
   try {
-    const answered = await post($, socket, PATH_ACK, { delivery_id: delivery, outcome, detail })
+    const answered = await post($, door, PATH_ACK, { delivery_id: delivery, outcome, detail })
 
     if (!answered.ok) {
       // Служба отказала: слово владельца осталось придержанным, и он видит это отметкой
@@ -279,16 +350,17 @@ const confirm = async (
 /**
  * notice извещает службу о границе хода и о проценте контекста. Ход этим не держится: ответа
  * извещение по контракту не ждёт, поэтому оно уходит без ожидания, а отказ уезжает в журнал
- * отладки — канала может не быть вовсе, и ронять им ход нельзя.
+ * отладки — канала может не быть вовсе, и ронять им ход нельзя. Ждать извещение может тот, кому
+ * нужен его исход раньше своего шага (`/away` после имени): отказом оно не кончается никогда.
  */
-const notice = ($: EngineInterface, path: string, body: unknown): void => {
-  const socket = front
+const notice = ($: EngineInterface, path: string, body: unknown): Promise<void> => {
+  const door = front
 
-  if (socket === undefined) {
-    return
+  if (door === undefined) {
+    return Promise.resolve()
   }
 
-  void post($, socket, path, body)
+  return post($, door, path, body)
     .then((answered: Answered) => {
       if (!answered.ok) {
         $.ui.log(`${path}: служба отказала ${answered.status} ${answered.text}`, { to: 'debug' })
@@ -299,7 +371,6 @@ const notice = ($: EngineInterface, path: string, body: unknown): void => {
     })
 }
 
-/**
 /**
  * context называет службе долю занятого окна контекста. Своего счёта мод не ведёт: число знает
  * клиент, у которого окно и считается, а мод его только проводит. Числа у клиента нет (модели без
@@ -318,7 +389,7 @@ const context = async ($: EngineInterface): Promise<void> => {
     return
   }
 
-  notice($, PATH_CONTEXT, { percent: share })
+  void notice($, PATH_CONTEXT, { percent: share })
 }
 
 /**
@@ -358,13 +429,13 @@ const reply = ($: EngineInterface, answered: { answer: string; stopReason: unkno
     return
   }
 
-  notice($, PATH_MESSAGE, { text })
+  void notice($, PATH_MESSAGE, { text })
 }
 
 /** release отдаёт новой подкоманде реплики, накопленные без неё, в порядке прихода. */
 const release = ($: EngineInterface): void => {
   for (const text of waiting.splice(0)) {
-    notice($, PATH_MESSAGE, { text })
+    void notice($, PATH_MESSAGE, { text })
   }
 }
 
@@ -379,33 +450,151 @@ const told = ($: EngineInterface): void => {
  * speakName называет службе запомненное название чата, если на этом входе оно ещё не названо.
  * Имя темы без аргумента служба берёт из него, а меняется оно — тема переименовывается.
  */
-const speakName = ($: EngineInterface): void => {
+const speakName = ($: EngineInterface): Promise<void> => {
   if (front === undefined || chat === '' || chat === named) {
-    return
+    return Promise.resolve()
   }
 
   named = chat
-  notice($, PATH_NAME, { name: chat })
+
+  return notice($, PATH_NAME, { name: chat })
 }
 
 /**
- * name запоминает название чата и называет его службе. Приходит оно не событием модуля, а входом
- * хука клиента (`session_title`), поэтому мод держит его сам и отдаёт, как только у соединения
- * есть вход: классический хук приходит раньше `session.start`, а вход поднимается им же.
+ * name запоминает название чата, которое назвал источник, и называет его службе. Событием модуля
+ * оно не приходит вовсе, поэтому мод держит его сам и отдаёт, как только у соединения есть вход:
+ * классический хук приходит раньше `session.start`, а вход поднимается им же.
  */
-const name = ($: EngineInterface, title: unknown): void => {
+const name = ($: EngineInterface, source: Source, title: unknown): void => {
   if (typeof title !== 'string') {
     return
   }
 
   const value = title.trim()
 
-  if (value === '' || value === chat) {
+  if (value === '' || value === heard[source]) {
+    return
+  }
+
+  heard[source] = value
+  $.ui.log(`${source === 'journal' ? 'журнал сессии' : 'вход хука'} назвал чат: ${value}`, {
+    to: 'debug',
+  })
+
+  if (value === chat) {
     return
   }
 
   chat = value
-  speakName($)
+  void speakName($)
+}
+
+/**
+ * latest находит в журнале последнюю запись вида `type` и отдаёт её поле `field`. Ищется ключ поля
+ * с конца текста, а разбирается только строка, где он стоит: журнал не раскладывается на записи
+ * целиком. Ключ без кавычек-экранов внутри строки чужой записи не встречается — кавычка в значении
+ * JSON экранируется, — а совпадение в записи другого вида отсеивает проверка `type`.
+ */
+const latest = (text: string, type: string, field: string): string | undefined => {
+  const key = `"${field}":`
+  let from = text.length
+
+  while (from >= 0) {
+    const found = text.lastIndexOf(key, from)
+
+    if (found === -1) {
+      return undefined
+    }
+
+    const start = text.lastIndexOf('\n', found) + 1
+    const end = text.indexOf('\n', found)
+    const line = text.slice(start, end === -1 ? undefined : end)
+
+    try {
+      const row = JSON.parse(line) as Record<string, unknown>
+      const value = row[field]
+
+      if (row.type === type && typeof value === 'string' && value.trim() !== '') {
+        return value
+      }
+    } catch {
+      // Последняя строка журнала может быть недописанной, пока клиент её пишет: прежние записи
+      // это не отменяет, и разбор идёт дальше к началу.
+    }
+
+    from = start - 2
+  }
+
+  return undefined
+}
+
+/**
+ * read заглядывает в журнал сессии за названием чата: последнее `custom-title` (`/rename`, хуки,
+ * `/away <имя>`), а без него — последнее `ai-title` (автоимя). Журнал, чьи размер и время правки
+ * не сменились, второй раз не читается; `$.fs.read` отдаёт файл только целиком, поэтому сменивший
+ * метку журнал читается весь, а больше 4 МиБ движок не читает вовсе — тогда названием остаётся
+ * то, что назвал вход хука, а отказ уходит в журнал отладки.
+ */
+const read = async ($: EngineInterface): Promise<void> => {
+  const path = journal
+
+  if (path === undefined) {
+    return
+  }
+
+  try {
+    const stat = await $.fs.stat(path)
+    const mark = `${stat.size}:${stat.mtimeMs}`
+
+    if (mark === journalMark) {
+      return
+    }
+
+    journalMark = mark
+
+    const text = await $.fs.read(path)
+
+    if (path !== journal) {
+      return
+    }
+
+    name($, 'journal', latest(text, 'custom-title', 'customTitle') ?? latest(text, 'ai-title', 'aiTitle'))
+  } catch (failure) {
+    $.ui.log(`журнал сессии не прочитан: ${reason(failure)}`, { to: 'debug' })
+  }
+}
+
+/** peek читает журнал, не начиная второго чтения рядом с идущим. */
+const peek = ($: EngineInterface): Promise<void> => {
+  peeking ??= read($).finally(() => {
+    peeking = undefined
+  })
+
+  return peeking
+}
+
+/** heed берёт из входа классического хука журнал сессии и название чата, а журнал читает. */
+const heed = ($: EngineInterface, event: { transcript_path?: unknown; session_title?: unknown }): void => {
+  if (typeof event.transcript_path === 'string' && event.transcript_path !== journal) {
+    journal = event.transcript_path
+    journalMark = ''
+    heard.journal = ''
+  }
+
+  name($, 'hook', event.session_title)
+  void peek($)
+}
+
+/**
+ * watch заводит опрос журнала таймером движка (`$.clock.every`): `/rename` модулю не сообщается
+ * ничем, и новое имя видно только записью журнала. Перезагрузка мода снимает таймер вместе с
+ * прежним окружением.
+ */
+const watch = ($: EngineInterface): void => {
+  polling?.cancel()
+  polling = $.clock.every(TITLE_POLL_MS, () => {
+    void peek($)
+  })
 }
 
 /**
@@ -537,18 +726,29 @@ const take = async ($: EngineInterface, line: string): Promise<void> => {
   }
 
   switch (event.event) {
-    case 'ready':
-      front = event.socket
+    case 'ready': {
+      const door = opened(event)
+
+      if (door === undefined) {
+        $.ui.log('подкоманда открыла соединение, но входа не назвала: ни сокета, ни адреса с ключом', {
+          to: 'debug',
+        })
+
+        return
+      }
+
+      front = door
       absent = undefined
       // Название, запомненное до входа, уходит службе сразу: иначе имя темы без аргумента пришлось
       // бы ждать следующего слова владельца, а его у не у компьютера может не быть вовсе.
       everOpened = true
       named = ''
-      speakName($)
+      void speakName($)
       release($)
-      $.ui.log(`соединение со службой открыто: ${event.socket}`, { to: 'debug' })
+      $.ui.log(`соединение со службой открыто: ${where(door)}`, { to: 'debug' })
 
       return
+    }
     case 'steady':
       // Сказанное о пропаже снимается, когда соединение прожило срок, а не на каждом `ready`:
       // служба, падающая сразу после приветствия, иначе сыпала бы тостами по кругу.
@@ -615,6 +815,21 @@ const switched = async (
   // Без соединения служба включила бы режим, а слово из темы в сессию не дошло бы.
   if (which === 'on' && absent !== undefined) {
     return { text: `${failed}: ${absent}` }
+  }
+
+  if (which === 'on') {
+    // Чат могли переименовать без промпта (`/rename`): журнал читается до включения, и тема без
+    // аргумента берёт свежее имя, а не то, что было на последнем слове владельца.
+    await peek($)
+
+    // Имя из аргумента — название чата: тема получает его сразу, сам чат — ближайшим промптом.
+    if (name !== '') {
+      chat = name
+      retitle = name
+      $.ui.log(`название чата из /away: ${name}`, { to: 'debug' })
+    }
+
+    await speakName($)
   }
 
   try {
@@ -726,7 +941,7 @@ const held = async (
   const ended = await child.result
   const how = ended.signal === null ? `код ${ended.code}` : `сигнал ${ended.signal}`
 
-  const opened = front !== undefined
+  const wasOpen = front !== undefined
 
   // Сокета подкоманды больше нет: сказать в него нечего, и `session.end` после этого `bye` не шлёт.
   front = undefined
@@ -745,7 +960,7 @@ const held = async (
 
   // Соединение, которое так и не открылось, — не пропажа, а мост, который не настроен: нет
   // настроек, служба отказала. Причину назовёт `/away`, а новый запуск того же не исправит.
-  if (!opened) {
+  if (!wasOpen) {
     const why = complaint === '' ? line : complaint
 
     // Подъём после сказанного «поднимаю заново» не открыл соединения: обещание не сбылось, и
@@ -783,18 +998,18 @@ const held = async (
 
 /** farewell говорит службе, что сессия кончилась: хоронит её служба сама. */
 const farewell = async ($: EngineInterface): Promise<void> => {
-  const socket = front
+  const door = front
 
   // Соединения нет: не поднялось или уже кончилось — на выходе клиента подкоманда сказала `bye`
   // сама, на остановке.
-  if (socket === undefined) {
+  if (door === undefined) {
     $.ui.log('конец сессии мод не говорит: соединения со службой нет', { to: 'debug' })
 
     return
   }
 
   try {
-    await post($, socket, PATH_BYE, {})
+    await post($, door, PATH_BYE, {})
   } catch (failure) {
     $.ui.log(`конец сессии службе не сказан: ${reason(failure)}`, { to: 'debug' })
   }
@@ -864,6 +1079,9 @@ const rebind = async ($: EngineInterface, session: string): Promise<void> => {
 
   $.ui.log(`подкоманда моста перепривязана к сессии ${session}`, { to: 'debug' })
   attach($, session)
+
+  // Конец прежней сессии мог прийти раньше и снять опрос: у продолженной сессии он свой.
+  watch($)
 }
 
 /** forget снимает отложенный подъём подкоманды. */
@@ -890,11 +1108,12 @@ const lose = ($: EngineInterface): void => {
 }
 
 export const register: Register = on => {
-  // Название чата клиент называет входом классического хука, а не событием модуля: у
-  // `session.start` его нет. Первое название приходит на старте и возврате сессии, дальше — со
-  // словом владельца, набранным в терминале, и переименование чата видно на следующем.
+  // Название чата событием модуля не приходит вовсе: у `session.start` его нет, а о `/rename`
+  // движок модулю не сообщает. Поэтому мод берёт его из двух мест — из входа классического хука
+  // (`session_title`, на старте, возврате и слове владельца) и из журнала сессии, путь к которому
+  // несёт тот же вход: журнал читается на этих хуках, на границах хода, перед `/away` и опросом.
   on('classic.SessionStart', async ($, event, next) => {
-    name($, event.session_title)
+    heed($, event)
 
     // `/resume` внутри процесса: клиент продолжает работу под другой сессией, а `session.start`
     // модулю не повторяет. Подкоманда переезжает на новую сессию сама.
@@ -905,10 +1124,22 @@ export const register: Register = on => {
     return next(event)
   })
 
-  on('classic.UserPromptSubmit', ($, event, next) => {
-    name($, event.session_title)
+  // Имя из `/away <имя>` чат получает здесь: ответ этого хука — единственное место, где модуль
+  // называет клиенту название чата (`sessionTitle`). Отдаётся оно один раз — дальше название
+  // чата снова ведёт сам клиент.
+  on('classic.UserPromptSubmit', async ($, event, next) => {
+    heed($, event)
 
-    return next(event)
+    const answered = await next(event)
+    const wanted = retitle
+
+    if (wanted === undefined) {
+      return answered
+    }
+
+    retitle = undefined
+
+    return { ...answered, sessionTitle: wanted }
   })
 
   on('session.start', async ($, event, next) => {
@@ -916,6 +1147,7 @@ export const register: Register = on => {
 
     await registered($)
     attach($, await $.session.id())
+    watch($)
 
     return started
   })
@@ -936,11 +1168,12 @@ export const register: Register = on => {
     if (event.agentId === undefined) {
       // Ход назван своим id: извещения ответа не ждут, и по нему служба гасит «печатает» только
       // того хода, чей конец пришёл, — поздний конец прошлого не гасит следующий.
-      notice($, PATH_TURN_START, { turn: event.turnId })
+      void notice($, PATH_TURN_START, { turn: event.turnId })
 
       // Между ходами окно контекста меняется само — сжатие, `/clear`, — поэтому процент
       // называется и на входе в ход, а не только на выходе из него.
       told($)
+      void peek($)
     }
 
     return next(event)
@@ -973,8 +1206,9 @@ export const register: Register = on => {
     const answered = await next(event)
 
     if (event.agentId === undefined) {
-      notice($, PATH_TURN_END, { turn: event.turnId })
+      void notice($, PATH_TURN_END, { turn: event.turnId })
       told($)
+      void peek($)
     }
 
     return answered
@@ -991,6 +1225,8 @@ export const register: Register = on => {
     // `bye` не говорит: он похоронил бы новую сессию.
     if (event.reason !== 'clear' && (linkedSession === undefined || event.sessionId === linkedSession)) {
       forget()
+      polling?.cancel()
+      polling = undefined
       await farewell($)
     }
 
